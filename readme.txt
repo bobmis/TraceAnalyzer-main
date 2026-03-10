@@ -73,4 +73,5 @@ Ctrl+C：复制选中行（如果没选中任何行，会复制全部）
 新增地址全查、指令全查
 【关联项目】
 https://github.com/jiqiu2022/vm-trace-release
+https://github.com/lxz-jiandan/TraceAnalyzer
 ================================================================================
