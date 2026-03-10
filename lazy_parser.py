@@ -1,5 +1,4 @@
-﻿"""
-鎳掑姞杞借В鏋愬櫒锛氬厛鏋勫缓鎸囦护绱㈠紩锛屾寜闇€瑙ｆ瀽璇︽儏銆?"""
+"""lazy_parser module."""
 
 import re
 from typing import List, Optional, Tuple
@@ -17,7 +16,7 @@ from parser import (
 
 
 class InstructionIndex:
-    """鍗曟潯鎸囦护鐨勮交閲忕储寮曢」銆?"""
+    """InstructionIndex class."""
 
     def __init__(
         self,
@@ -40,7 +39,7 @@ class InstructionIndex:
 
 
 class LazyLogParser:
-    """闈㈠悜澶ф棩蹇楃殑鎳掕В鏋愬櫒锛屾彁鍗?UI 鍝嶅簲閫熷害銆?"""
+    """LazyLogParser class."""
 
     def __init__(self, file_path: str):
         self.file_path = file_path
@@ -49,8 +48,8 @@ class LazyLogParser:
         self._file_lines: Optional[List[str]] = None
 
     def build_index(self) -> Tuple[int, Optional[str]]:
-        """鎵弿涓€娆″苟鏋勫缓鎸囦护绱㈠紩銆?"""
-        print("姝ｅ湪寤虹珛鎸囦护绱㈠紩...")
+        """build_index function."""
+        print("Building instruction index...")
 
         with open(self.file_path, "r", encoding="utf-8", errors="ignore") as f:
             current_offset = 0
@@ -86,15 +85,15 @@ class LazyLogParser:
         return len(self.instruction_indices), self.initial_sp
 
     def load_file_lines(self):
-        """涓€娆℃€у姞杞藉叏閮ㄨ锛屾彁鍗囬殢鏈鸿闂В鏋愭€ц兘銆?"""
+        """load_file_lines function."""
         if self._file_lines is None:
-            print("鍔犺浇鏂囦欢鍒板唴瀛?..")
+            print("Loading file lines into memory...")
             with open(self.file_path, "r", encoding="utf-8", errors="ignore") as f:
                 self._file_lines = f.readlines()
             print(f"文件已加载，共 {len(self._file_lines)} 行")
 
     def parse_instruction_at(self, index: int) -> Optional[Instruction]:
-        """瑙ｆ瀽鎸囧畾绱㈠紩鐨勬寚浠ゅ強鍏跺悗缁唴瀛樿銆?"""
+        """parse_instruction_at function."""
         if index < 0 or index >= len(self.instruction_indices):
             return None
 
@@ -162,7 +161,7 @@ class LazyLogParser:
         return instruction
 
     def parse_batch(self, start_index: int, count: int) -> List[Instruction]:
-        """鎵归噺瑙ｆ瀽涓€娈垫寚浠ゃ€?"""
+        """parse_batch function."""
         instructions: List[Instruction] = []
         end_index = min(start_index + count, len(self.instruction_indices))
         for i in range(start_index, end_index):
@@ -172,11 +171,11 @@ class LazyLogParser:
         return instructions
 
     def get_instruction_count(self) -> int:
-        """鑾峰彇鎸囦护鎬绘暟銆?"""
+        """get_instruction_count function."""
         return len(self.instruction_indices)
 
     def get_instruction_info(self, index: int) -> Optional[InstructionIndex]:
-        """鎸夌储寮曡幏鍙栬交閲忔寚浠ゅ厓淇℃伅銆?"""
+        """get_instruction_info function."""
         if 0 <= index < len(self.instruction_indices):
             return self.instruction_indices[index]
         return None

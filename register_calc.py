@@ -1,6 +1,4 @@
-﻿"""
-瀵勫瓨鍣ㄧ姸鎬佽绠楁ā鍧?- 浣跨敤妫€鏌ョ偣缂撳瓨浼樺寲璁＄畻
-"""
+"""register_calc module."""
 import bisect
 import time
 import re
@@ -14,10 +12,7 @@ if TYPE_CHECKING:
 
 
 class RegisterCalculator:
-    """瀵勫瓨鍣ㄧ姸鎬佽绠楀櫒
-    
-    浣跨敤CacheWorker鐨勬鏌ョ偣杩涜蹇€熻绠楋紝鏀寔锛?    1. 蹇€熸煡鎵炬渶杩戞鏌ョ偣
-    2. 澧為噺璁＄畻鍒扮洰鏍囦綅缃?    3. 鎸夐渶杩芥函鐗瑰畾瀵勫瓨鍣?    """
+    """RegisterCalculator class."""
     
     def __init__(self, parser: 'LazyLogParser', cache_worker: 'CacheWorker'):
         self.parser = parser
@@ -27,18 +22,12 @@ class RegisterCalculator:
         self._local_cache_max_size = 50
     
     def set_parser(self, parser: 'LazyLogParser'):
-        """璁剧疆瑙ｆ瀽鍣?"""
+        """set_parser function."""
         self.parser = parser
         self._local_cache.clear()
     
     def compute_state_at(self, index: int, registers_to_show: Optional[Set[str]] = None) -> RegisterState:
-        """璁＄畻鎸囧畾浣嶇疆鐨勫瘎瀛樺櫒鐘舵€?        
-        Args:
-            index: 鎸囦护绱㈠紩
-            registers_to_show: 闇€瑕佹樉绀虹殑瀵勫瓨鍣ㄩ泦鍚堬紙None琛ㄧず鎵€鏈夊凡淇敼鐨勫瘎瀛樺櫒锛?        
-        Returns:
-            RegisterState 瀵硅薄
-        """
+        """compute_state_at function."""
         compute_start = time.time()
         
         if index < 0 or not self.parser:
@@ -47,7 +36,6 @@ class RegisterCalculator:
         if index in self._local_cache:
             return self._local_cache[index].copy()
         
-        # 鎵惧埌鏈€杩戠殑妫€鏌ョ偣
         checkpoint_index = self.cache_worker.find_nearest_checkpoint(index)
         
         if checkpoint_index >= 0:
@@ -79,17 +67,15 @@ class RegisterCalculator:
         
         compute_time = (time.time() - compute_start) * 1000
         if compute_time > 50:
-            print(f"[RegisterCalc] 璁＄畻浣嶇疆 {index}, 浠庢鏌ョ偣 {checkpoint_index} 寮€濮? "
-                  f"澶勭悊 {instructions_processed} 鏉℃寚浠? 鑰楁椂 {compute_time:.1f}ms")
+            print(
+                f"[RegisterCalc] compute index {index}, from checkpoint {checkpoint_index}, "
+                f"processed {instructions_processed} instructions, took {compute_time:.1f}ms"
+            )
         
         return state
     
     def compute_state_for_display(self, index: int) -> tuple:
-        """璁＄畻鐢ㄤ簬鏄剧ず鐨勫瘎瀛樺櫒鐘舵€侊紙褰撳墠鐘舵€佸拰鍓嶄竴涓姸鎬侊級
-        
-        Returns:
-            (current_state, prev_state, changed_registers)
-        """
+        """compute_state_for_display function."""
         if index < 0 or not self.parser:
             return RegisterState(), RegisterState(), set()
         
@@ -101,7 +87,6 @@ class RegisterCalculator:
         if index > 0:
             prev_state = self.compute_state_at(index - 1, all_registers)
         
-        # 鑾峰彇褰撳墠鎸囦护淇敼鐨勫瘎瀛樺櫒
         changed_registers = set()
         instruction = self.parser.parse_instruction_at(index)
         if instruction:
@@ -116,19 +101,12 @@ class RegisterCalculator:
         return current_state, prev_state, changed_registers
     
     def trace_register_source(self, register: str, from_index: int) -> Optional[int]:
-        """杩借釜瀵勫瓨鍣ㄦ潵婧愶紙鍚戜笂鏌ユ壘鏈€鍚庝竴娆′慨鏀圭殑浣嶇疆锛?        
-        Args:
-            register: 瀵勫瓨鍣ㄥ悕
-            from_index: 浠庡摢涓綅缃紑濮嬪悜涓婃煡鎵?        
-        Returns:
-            鎵惧埌鐨勬寚浠ょ储寮曪紝濡傛灉娌℃壘鍒拌繑鍥濶one
-        """
+        """trace_register_source function."""
         if from_index < 0 or not self.parser:
             return None
         
         related_registers = self.get_related_registers(register)
         
-        # 鍚戝墠鏌ユ壘
         for i in range(from_index - 1, -1, -1):
             instruction = self.parser.parse_instruction_at(i)
             if instruction:
@@ -140,7 +118,7 @@ class RegisterCalculator:
 
     @staticmethod
     def _normalize_taint_register(reg_name: str) -> Optional[str]:
-        """鏍囧噯鍖栨薄鐐瑰瘎瀛樺櫒鍚嶇О锛圵n 鏄犲皠鍒?Xn锛夈€?"""
+        """_normalize_taint_register function."""
         if not reg_name:
             return None
 
@@ -170,7 +148,7 @@ class RegisterCalculator:
 
     @staticmethod
     def _extract_read_registers(mnemonic: str, operands: str, writes: Set[str]) -> Set[str]:
-        """鎻愬彇鎸囦护璇诲彇鐨勫瘎瀛樺櫒锛堢矖绮掑害锛屽鐢ㄤ簬鍙嶅悜姹＄偣锛夈€?"""
+        """_extract_read_registers function."""
         read_regs: Set[str] = set()
         if not operands:
             return read_regs
@@ -198,9 +176,7 @@ class RegisterCalculator:
         return read_regs
 
     def reverse_taint_trace(self, register: str, from_index: int, max_steps: int = 300) -> List[Dict]:
-        """
-        鍙嶅悜姹＄偣鍒嗘瀽锛氫粠缁撴灉瀵勫瓨鍣ㄥ悜涓婂洖婧叾渚濊禆鐨勮绠楄繃绋嬨€?
-        杩斿洖閾捐矾鎸夆€滅敱杩戝埌杩溾€濇帓搴忥紙鍏堝嚭鐜扮缁撴灉鏈€杩戠殑鎸囦护锛夈€?        """
+        """reverse_taint_trace function."""
         if from_index < 0 or not self.parser:
             return []
 
@@ -605,11 +581,7 @@ class RegisterCalculator:
         max_scan: int = 20000,
         max_calc_steps: int = 120,
     ) -> Dict:
-        """
-        数据来源追踪（以值为中心）:
-        1) 锁定读取值（如 ldrb ... => w8=0x4a）
-        2) 回溯最近匹配的内存写入，并展开计算链指令
-        """
+        """trace_data_provenance function."""
         result: Dict = {
             "target_register": (register or "").upper(),
             "query_index": from_index,
@@ -699,9 +671,8 @@ class RegisterCalculator:
         return result
 
     def _add_to_local_cache(self, index: int, state: RegisterState):
-        """娣诲姞鍒版湰鍦扮紦瀛?"""
+        """_add_to_local_cache function."""
         if len(self._local_cache) >= self._local_cache_max_size:
-            # 绉婚櫎鏈€鏃х殑缂撳瓨锛堢畝鍗曠瓥鐣ワ細绉婚櫎绗竴涓級
             if self._local_cache:
                 oldest_key = next(iter(self._local_cache))
                 del self._local_cache[oldest_key]
@@ -709,12 +680,12 @@ class RegisterCalculator:
         self._local_cache[index] = state
     
     def clear_local_cache(self):
-        """娓呯┖鏈湴缂撳瓨"""
+        """clear_local_cache function."""
         self._local_cache.clear()
     
     @staticmethod
     def get_related_registers(register: str) -> List[str]:
-        """鑾峰彇鐩稿叧瀵勫瓨鍣紙W鍜孹鏄悓涓€瀵勫瓨鍣級"""
+        """get_related_registers function."""
         registers = [register]
         
         if register.startswith('W') and register[1:].isdigit():
@@ -726,7 +697,7 @@ class RegisterCalculator:
     
     @staticmethod
     def get_all_arm64_registers() -> Set[str]:
-        """鑾峰彇鎵€鏈堿RM64瀵勫瓨鍣ㄥ悕"""
+        """get_all_arm64_registers function."""
         registers = set()
         for i in range(31):
             registers.add(f'X{i}')
@@ -737,7 +708,7 @@ class RegisterCalculator:
     
     @staticmethod
     def get_register_sort_key(register: str) -> tuple:
-        """鑾峰彇瀵勫瓨鍣ㄦ帓搴忛敭锛堥檷搴忥細X30...X0, 鐗规畩瀵勫瓨鍣ㄥ湪鍓嶏級"""
+        """get_register_sort_key function."""
         special_order = {
             'SP': (0, 0),
             'FP': (0, 1),
@@ -750,7 +721,7 @@ class RegisterCalculator:
         
         if register.startswith('X') and register[1:].isdigit():
             num = int(register[1:])
-            return (1, -num)  # 璐熸暟瀹炵幇闄嶅簭
+            return (1, -num)
         
         if register.startswith('W') and register[1:].isdigit():
             num = int(register[1:])

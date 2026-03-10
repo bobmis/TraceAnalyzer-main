@@ -1,15 +1,11 @@
-﻿"""
-Trace 鏃ュ織瑙ｆ瀽宸ュ叿銆?
-鏀寔鐨勬寚浠よ鏍煎紡锛?1) 浼犵粺 log.txt 椋庢牸锛?   0xADDR\t0xOFF\tmnemonic\toperands\t;REG=old -> new,...
-2) sub_e4110 椋庢牸锛?   [time][module off][opcode] 0xADDR: "mnemonic operands" before => after
-"""
+"""parser module."""
 
 from typing import Dict, List, Optional, Tuple
 import re
 
 
 class RegisterChange:
-    """瀵勫瓨鍣ㄥ€煎彉鍖栬褰曘€?"""
+    """RegisterChange class."""
 
     def __init__(self, register: str, old_value: str, new_value: str):
         self.register = register
@@ -18,10 +14,10 @@ class RegisterChange:
 
 
 class MemoryOperation:
-    """鍐呭瓨璇诲啓鎿嶄綔銆?"""
+    """MemoryOperation class."""
 
     def __init__(self, op_type: str, address: str, instruction_address: str, data_size: int, data_value: str):
-        self.type = op_type  # 'read' 鎴?'write'
+        self.type = op_type
         self.address = address
         self.instruction_address = instruction_address
         self.data_size = data_size
@@ -29,7 +25,7 @@ class MemoryOperation:
 
 
 class MemoryDumpLine:
-    """鍐呭瓨杞偍琛屻€?"""
+    """MemoryDumpLine class."""
 
     def __init__(self, address: str, data: List[str], is_modified: bool):
         self.address = address
@@ -38,7 +34,7 @@ class MemoryDumpLine:
 
 
 class Instruction:
-    """瑙ｆ瀽鍚庣殑鎸囦护璁板綍銆?"""
+    """Instruction class."""
 
     def __init__(
         self,
@@ -64,10 +60,7 @@ class Instruction:
 
 
 def parse_register_changes(register_str: str) -> List[RegisterChange]:
-    """
-    瑙ｆ瀽浼犵粺鏍煎紡涓殑瀵勫瓨鍣ㄥ彉鍖栨敞閲娿€?
-    绀轰緥锛?      FP=0x0 -> 0x7c2a1f9170, LR=0x2a -> 0x7b76574884
-    """
+    """parse_register_changes function."""
     changes: List[RegisterChange] = []
     if not register_str:
         return changes
@@ -85,7 +78,7 @@ def parse_register_changes(register_str: str) -> List[RegisterChange]:
 
 
 def _parse_register_assignments(register_str: str) -> Dict[str, str]:
-    """瑙ｆ瀽瀵勫瓨鍣ㄨ祴鍊兼枃鏈紝濡?`x8=0x1 sp=0x2`銆?"""
+    """_parse_register_assignments function."""
     assignments: Dict[str, str] = {}
     if not register_str:
         return assignments
@@ -99,7 +92,7 @@ def _parse_register_assignments(register_str: str) -> Dict[str, str]:
 
 
 def parse_register_changes_from_transition(before_str: str, after_str: str) -> List[RegisterChange]:
-    """浠?`<before> => <after>` 鏂囨湰涓彁鍙栧瘎瀛樺櫒鍙樺寲銆?"""
+    """parse_register_changes_from_transition function."""
     before_map = _parse_register_assignments(before_str)
     after_map = _parse_register_assignments(after_str)
 
@@ -112,7 +105,7 @@ def parse_register_changes_from_transition(before_str: str, after_str: str) -> L
 
 
 def parse_register_changes_from_line(line: str) -> List[RegisterChange]:
-    """浠庢暣琛屾寚浠ゆ枃鏈腑鐩存帴鎻愬彇瀵勫瓨鍣ㄥ彉鍖栥€?"""
+    """parse_register_changes_from_line function."""
     trimmed = line.strip()
     if not trimmed:
         return []
@@ -132,7 +125,7 @@ def parse_register_changes_from_line(line: str) -> List[RegisterChange]:
 
 
 def _parse_register_string_annotations(register_str: str) -> Dict[str, str]:
-    """瑙ｆ瀽缁戝畾鍦ㄥ瘎瀛樺櫒鍊间笂鐨?`(string: "...")` 娉ㄨВ銆?"""
+    """_parse_register_string_annotations function."""
     annotations: Dict[str, str] = {}
     if not register_str:
         return annotations
@@ -146,7 +139,7 @@ def _parse_register_string_annotations(register_str: str) -> Dict[str, str]:
 
 
 def _string_to_hex_bytes(text: str) -> str:
-    """灏嗗瓧绗︿覆杞崲涓轰互绌烘牸鍒嗛殧鐨勫崄鍏繘鍒跺瓧鑺備覆銆?"""
+    """_string_to_hex_bytes function."""
     if text is None:
         return ""
     data = text.encode("utf-8", errors="replace")
@@ -154,7 +147,7 @@ def _string_to_hex_bytes(text: str) -> str:
 
 
 def _extract_trace_snapshots(line: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
-    """鎻愬彇 `<before> => <after>` 蹇収鍙婂叾瀛楃涓叉敞瑙ｃ€?"""
+    """_extract_trace_snapshots function."""
     trimmed = line.strip()
     trace_match = re.search(r':\s*"[^"]*"\s*(.*)$', trimmed)
     trace_part = trace_match.group(1).strip() if trace_match else trimmed
@@ -174,11 +167,7 @@ def _extract_trace_snapshots(line: str) -> Tuple[Dict[str, str], Dict[str, str],
 def _extract_legacy_comment_snapshots(
     line: str,
 ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str], Dict[str, str]]:
-    """
-    浠?';' 鍚庣殑浼犵粺娉ㄩ噴涓彁鍙栧墠鍚庡揩鐓с€?
-    鍚屾椂鏀寔锛?      REG=old -> new
-      REG=value
-    """
+    """_extract_legacy_comment_snapshots function."""
     semicolon_index = line.find(";")
     if semicolon_index == -1:
         return {}, {}, {}, {}
@@ -399,9 +388,7 @@ def infer_memory_operation_from_instruction(
     operands: str,
     instruction_address: str,
 ) -> Optional[MemoryOperation]:
-    """
-    浠庡崟鏉?trace 鎸囦护鏂囨湰涓帹鏂唴瀛樿闂€?
-    褰撴棩蹇楁病鏈夋樉寮?`memory read/write` 琛屾椂浣跨敤銆?    """
+    """infer_memory_operation_from_instruction function."""
     if "[" not in operands or "]" not in operands:
         return None
 
@@ -440,7 +427,7 @@ def infer_memory_operation_from_instruction(
 
 
 def parse_memory_operation(line: str) -> Optional[MemoryOperation]:
-    """瑙ｆ瀽浼犵粺鏍煎紡鐨?memory read/write 琛屻€?"""
+    """parse_memory_operation function."""
     write_pattern = (
         r"memory write at (0x[0-9a-f]+), instruction address = (0x[0-9a-f]+), "
         r"data size = (\d+), data value = ([0-9a-f]+)"
@@ -473,11 +460,7 @@ def parse_memory_operation(line: str) -> Optional[MemoryOperation]:
 
 
 def parse_memory_dump_line(line: str) -> Optional[MemoryDumpLine]:
-    """
-    瑙ｆ瀽浼犵粺鏍煎紡鐨勫唴瀛樿浆鍌ㄨ銆?
-    绀轰緥锛?      7c2a1f9178  2a 00 00 ... |...|
-      *7c2a1f9178 2a 00 00 ... |...|
-    """
+    """parse_memory_dump_line function."""
     trimmed = line.strip()
     if not trimmed:
         return None
@@ -503,10 +486,7 @@ def parse_memory_dump_line(line: str) -> Optional[MemoryDumpLine]:
 
 
 def parse_instruction_fields(line: str) -> Optional[Dict[str, str]]:
-    """
-    瑙ｆ瀽鎸囦护鍏冧俊鎭紝渚涚储寮曡鍥句娇鐢ㄣ€?
-    杩斿洖瀛楁锛?      address, offset, mnemonic, operands, comment
-    """
+    """parse_instruction_fields function."""
     trimmed = line.strip()
     if not trimmed:
         return None
@@ -540,7 +520,6 @@ def parse_instruction_fields(line: str) -> Optional[Dict[str, str]]:
             "comment": comment,
         }
 
-    # sub_e4110 鏍煎紡銆?    # 绀轰緥锛?    # [11:14:58 826][libweapon.so 0x0e4110] [fd7bbaa9] 0x400e4110: "stp ..." x29=... => x29=...
     sub_match = re.match(
         r'^(?:\[[^\]]+\]\s*)+\s*(0x[0-9a-fA-F]+):\s*"([^"]*)"(?:\s*(.*))?$',
         trimmed,
@@ -575,7 +554,7 @@ def parse_instruction_fields(line: str) -> Optional[Dict[str, str]]:
 
 
 def parse_instruction_line(line: str, line_number: int) -> Optional[Instruction]:
-    """瑙ｆ瀽鍗曟潯鎸囦护琛岋紙鏀寔涓ょ鏍煎紡锛夈€?"""
+    """parse_instruction_line function."""
     fields = parse_instruction_fields(line)
     if not fields:
         return None
@@ -604,7 +583,7 @@ def parse_instruction_line(line: str, line_number: int) -> Optional[Instruction]
 
 
 def parse_log_file(file_path: str) -> Tuple[List[Instruction], Optional[str]]:
-    """椤哄簭瑙ｆ瀽瀹屾暣鏃ュ織鏂囦欢銆?"""
+    """parse_log_file function."""
     instructions: List[Instruction] = []
     initial_sp: Optional[str] = None
 

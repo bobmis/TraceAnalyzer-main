@@ -1,9 +1,4 @@
-﻿"""
-TraceAnalyzer 主程序。
-
-负责界面初始化、文件解析、寄存器与内存展示，
-以及地址全查与指令全查功能。
-"""
+"""main module."""
 import sys
 import time
 import re
@@ -28,10 +23,10 @@ from ui_components import UIFactory, get_dark_stylesheet
 
 
 class ParseThread(QThread):
-    """文件解析线程。"""
-    finished = Signal(object, object)  # 解析器与初始 SP
+    """ParseThread class."""
+    finished = Signal(object, object)
     error = Signal(str)
-    file_loaded = Signal()  # 文件行加载完成
+    file_loaded = Signal()
 
     def __init__(self, file_path: str):
         super().__init__()
@@ -150,7 +145,7 @@ class MainWindow(QMainWindow):
         self.setup_shortcuts()
     
     def _create_instruction_panel(self) -> QFrame:
-        """创建左侧指令面板。"""
+        """_create_instruction_panel function."""
         panel = QFrame()
         panel.setFrameShape(QFrame.StyledPanel)
         layout = QVBoxLayout(panel)
@@ -167,7 +162,7 @@ class MainWindow(QMainWindow):
         return panel
     
     def load_file(self):
-        """选择并加载日志文件。"""
+        """load_file function."""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择日志文件", "", "Text Files (*.txt);;All Files (*)"
         )
@@ -190,7 +185,7 @@ class MainWindow(QMainWindow):
         self.parse_thread.start()
     
     def _cleanup(self):
-        """清理当前会话数据与缓存。"""
+        """_cleanup function."""
         if self.cache_worker:
             self.cache_worker.stop()
             self.cache_worker = None
@@ -210,7 +205,7 @@ class MainWindow(QMainWindow):
             self.instruction_view.clear()
     
     def on_parse_finished(self, parser: LazyLogParser, initial_sp: Optional[str]):
-        """解析完成后初始化缓存与视图。"""
+        """on_parse_finished function."""
         self.parser = parser
         self.instruction_count = parser.get_instruction_count()
         self.initial_sp = initial_sp
@@ -229,17 +224,17 @@ class MainWindow(QMainWindow):
         self.stats_label.setText(f'Total {self.instruction_count:,} instructions')
         
     def on_parse_error(self, error_msg: str):
-        """解析失败回调。"""
+        """on_parse_error function."""
         QMessageBox.critical(self, "错误", f"解析文件失败: {error_msg}")
         self.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.status_label.setText("加载失败")
 
     def on_file_lines_loaded(self):
-        """文件行加载完成后触发表格初始化。"""
+        """on_file_lines_loaded function."""
         QTimer.singleShot(10, self.delayed_update_table)
     def delayed_update_table(self):
-        """延迟刷新表格并启动检查点构建。"""
+        """delayed_update_table function."""
         self.instruction_view.initialize_table(500)
 
         self.status_label.setText("就绪")
@@ -250,39 +245,39 @@ class MainWindow(QMainWindow):
         self.cache_worker.start_building_checkpoints()
 
     def on_checkpoint_ready(self, index: int, state: RegisterState):
-        """检查点就绪回调。"""
-        pass  # 预留：可用于更新 UI 提示
+        """on_checkpoint_ready function."""
+        pass
     
     def on_cache_progress(self, current: int, total: int):
-        """缓存构建进度回调。"""
+        """on_cache_progress function."""
         if total > 0:
             percent = current * 100 // total
             self.stats_label.setText(f'Total {self.instruction_count:,} instructions')
     
     def on_all_checkpoints_ready(self):
-        """所有检查点构建完成回调。"""
+        """on_all_checkpoints_ready function."""
         self.stats_label.setText(f'Total {self.instruction_count:,} instructions')
         print("[缓存] 所有检查点构建完成")
     
     def on_request_precache(self, start: int, end: int):
-        """请求预缓存指定范围。"""
+        """on_request_precache function."""
         if self.cache_worker:
             self.cache_worker.request_range_cache(start, end)
     
     def on_scroll_stopped(self, index: int):
-        """滚动停止后更新详情。"""
+        """on_scroll_stopped function."""
         self.selected_index = index
         self.update_selected_instruction_details()
     
     def on_instruction_clicked_virtual(self, logical_row: int):
-        """点击虚拟表格行后更新详情。"""
+        """on_instruction_clicked_virtual function."""
         self.selected_index = logical_row
         if self.instruction_view:
             self.instruction_view.on_instruction_clicked()
         self.update_selected_instruction_details()
     
     def on_instruction_selected_virtual(self, logical_row: int):
-        """选择变化时更新详情。"""
+        """on_instruction_selected_virtual function."""
         if not self.instruction_view or not self.instruction_view.allow_heavy_update:
             return
         
@@ -290,7 +285,7 @@ class MainWindow(QMainWindow):
         self.update_selected_instruction_details()
     
     def update_selected_instruction_details(self):
-        """刷新当前选中指令的寄存器与内存信息。"""
+        """update_selected_instruction_details function."""
         if self.selected_index < 0 or not self.parser:
             return
         
@@ -316,7 +311,7 @@ class MainWindow(QMainWindow):
             print(f"[性能] 详情面板刷新耗时 {total_time:.1f}ms (寄存器 {reg_time:.1f}ms, 内存 {mem_time:.1f}ms)")
     
     def update_register_display(self, index: int):
-        """刷新寄存器面板。"""
+        """update_register_display function."""
         if index < 0 or not self.register_calc:
             self.register_table.setRowCount(0)
             return
@@ -400,12 +395,12 @@ class MainWindow(QMainWindow):
     
     @staticmethod
     def _string_to_hex_bytes(text: str) -> str:
-        """将字符串转换为十六进制字节串。"""
+        """_string_to_hex_bytes function."""
         data = text.encode("utf-8", errors="replace")
         return " ".join(f"{byte:02X}" for byte in data)
 
     def _extract_string_annotations(self, raw_line: str) -> List[Tuple[str, str, str, str]]:
-        """提取 trace 行中的字符串注解。"""
+        """_extract_string_annotations function."""
         hints: List[Tuple[str, str, str, str]] = []
         if not raw_line:
             return hints
@@ -447,7 +442,7 @@ class MainWindow(QMainWindow):
         return value_text, text
 
     def update_memory_display(self, instruction: Instruction):
-        """刷新内存面板显示。"""
+        """update_memory_display function."""
         string_hints = self._extract_string_annotations(instruction.raw_line)
 
         if instruction.memory_dump:
@@ -496,7 +491,7 @@ class MainWindow(QMainWindow):
         self.memory_display.setPlainText("No memory data for this instruction.")
 
     def on_register_double_click(self, row: int, column: int):
-        """双击寄存器后追踪来源。"""
+        """on_register_double_click function."""
         item = self.register_table.item(row, 0)
         if item:
             register = item.text()
@@ -504,7 +499,7 @@ class MainWindow(QMainWindow):
             self.trace_register_source(register)
 
     def on_register_click(self):
-        """记录当前选中的寄存器。"""
+        """on_register_click function."""
         selected_items = self.register_table.selectedItems()
         if selected_items:
             row = selected_items[0].row()
@@ -514,7 +509,7 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(f"已选寄存器: {self.selected_register}（按 PgUp 可追踪来源）")
 
     def show_register_menu(self, position):
-        """显示寄存器右键菜单。"""
+        """show_register_menu function."""
         item = self.register_table.itemAt(position)
         if not item:
             return
@@ -539,7 +534,7 @@ class MainWindow(QMainWindow):
             self.analyze_reverse_taint(register)
 
     def trace_register_source(self, register: str):
-        """向上追踪寄存器最近一次写入位置。"""
+        """trace_register_source function."""
         if self.selected_index < 0 or not self.register_calc:
             self.status_label.setText("请先选择一条指令")
             return
@@ -560,7 +555,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"未找到寄存器 {register} 的来源")
 
     def _current_selected_register(self) -> Optional[str]:
-        """获取当前选中的寄存器名称。"""
+        """_current_selected_register function."""
         if self.selected_register:
             return self.selected_register
 
@@ -573,7 +568,7 @@ class MainWindow(QMainWindow):
         return reg_item.text() if reg_item else None
 
     def _show_reverse_taint_dialog(self, register: str, chain: List[dict]):
-        """显示反向污点分析结果。"""
+        """_show_reverse_taint_dialog function."""
         dialog = QDialog(self)
         dialog.setWindowTitle(f"反向污点分析: {register}")
         dialog.resize(1380, 760)
@@ -647,7 +642,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def analyze_reverse_taint(self, register: Optional[str] = None):
-        """从结果寄存器反向回溯计算过程（寄存器级）。"""
+        """analyze_reverse_taint function."""
         if self.selected_index < 0 or not self.register_calc:
             self.status_label.setText("请先选择一条指令")
             return
@@ -758,7 +753,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def analyze_data_provenance(self, register: Optional[str] = None):
-        """按数据值回溯来源，重点追踪内存值变化。"""
+        """analyze_data_provenance function."""
         if self.selected_index < 0 or not self.register_calc:
             self.status_label.setText("请先选择一条指令")
             return
@@ -785,7 +780,7 @@ class MainWindow(QMainWindow):
         self._show_data_provenance_dialog(target_register, trace_result)
 
     def select_register_in_table(self, register: str):
-        """在寄存器表格中定位并选中指定寄存器。"""
+        """select_register_in_table function."""
         for row in range(self.register_table.rowCount()):
             item = self.register_table.item(row, 0)
             if item and item.text() == register:
@@ -1243,7 +1238,7 @@ class MainWindow(QMainWindow):
         self._show_mnemonic_matches_dialog(query, matches)
 
     def search_instruction(self):
-        """按行号、地址、内存地址或助记符搜索。"""
+        """search_instruction function."""
         search_text = self.search_input.text().strip()
         if not search_text or not self.parser:
             return
@@ -1289,7 +1284,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "搜索结果", f"未找到匹配项: {search_text}")
 
     def setup_shortcuts(self):
-        """注册快捷键。"""
+        """setup_shortcuts function."""
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(lambda: self.search_input.setFocus())
         QShortcut(QKeySequence("F3"), self).activated.connect(self.search_instruction)
         QShortcut(QKeySequence("Ctrl+Shift+F"), self).activated.connect(self.search_all_addresses)
@@ -1303,7 +1298,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("PgDown"), self).activated.connect(self.navigate_history_back)
 
     def navigate_instruction(self, delta: int):
-        """按相对偏移移动当前选择。"""
+        """navigate_instruction function."""
         if not self.parser or not self.virtual_table:
             return
 
@@ -1323,7 +1318,7 @@ class MainWindow(QMainWindow):
             self.update_selected_instruction_details()
 
     def add_to_history(self, index: int):
-        """记录导航历史。"""
+        """add_to_history function."""
         if self.history and self.history_index < len(self.history) - 1:
             self.history = self.history[: self.history_index + 1]
 
@@ -1337,7 +1332,7 @@ class MainWindow(QMainWindow):
             self.history_index = len(self.history) - 1
 
     def quick_trace_register(self):
-        """快速追踪当前寄存器来源。"""
+        """quick_trace_register function."""
         if not self.parser:
             return
 
@@ -1347,19 +1342,19 @@ class MainWindow(QMainWindow):
             self.status_label.setText("提示: 请先选中寄存器，再按 PgUp 追踪来源")
 
     def quick_data_provenance(self):
-        """快速执行数据来源追踪（Ctrl+T）。"""
+        """quick_data_provenance function."""
         if not self.parser:
             return
         self.analyze_data_provenance()
 
     def quick_reverse_taint(self):
-        """快速执行反向污点分析（Ctrl+Shift+T）。"""
+        """quick_reverse_taint function."""
         if not self.parser:
             return
         self.analyze_reverse_taint()
 
     def navigate_history_back(self):
-        """回退到上一条历史定位。"""
+        """navigate_history_back function."""
         if not self.parser or not self.history:
             self.status_label.setText("没有历史记录")
             return
@@ -1379,7 +1374,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("已经是最早的历史记录")
 
     def jump_to_instruction(self, index: int, add_history: bool = True):
-        """跳转到指定指令。"""
+        """jump_to_instruction function."""
         if index < 0 or index >= self.instruction_count or not self.virtual_table:
             return
 
@@ -1400,7 +1395,7 @@ class MainWindow(QMainWindow):
         self.update_selected_instruction_details()
 
     def closeEvent(self, event):
-        """关闭窗口时停止后台任务。"""
+        """closeEvent function."""
         if self.cache_worker:
             self.cache_worker.stop()
         if self.virtual_table:
@@ -1420,8 +1415,6 @@ def main():
 
 if __name__ == '__main__':
     #python -m venv venv
-    #python main.py 直接运行程序
-    #build_exe.bat 编译exe
     main()
 
 
