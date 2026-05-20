@@ -5,3 +5,12 @@
 /build/
 /dist/
 /*.spec
+/*.traceidx.dat
+/*.traceidx.json
+/*.traceidx.chk
+/*.traceidx.mnx
+/*.traceidx.ofm
+/*.traceidx.ofx
+/*.traceidx.rgx
+/*.traceidx.mem
+/*.traceidx.mwr

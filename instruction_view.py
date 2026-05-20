@@ -40,7 +40,7 @@ class DataCacheWorker(QThread):
             for i in range(start, end):
                 if not self._running:
                     break
-                instr_info = self.parser.get_instruction_info(i)
+                instr_info = self.parser.get_instruction_info(i, include_line_text=True)
                 if instr_info:
                     self.data_cache[i] = {
                         'num': str(i + 1),
@@ -232,6 +232,7 @@ class VirtualScrollTable(QWidget):
         if self.data_cache:
             self.data_cache.stop()
             self.data_cache.wait()
+            self.data_cache = None
         
         self.parser = parser
         self.total_rows = total_rows
@@ -244,12 +245,7 @@ class VirtualScrollTable(QWidget):
         self.scrollbar.setMaximum(max_scroll)
         self.scrollbar.setPageStep(self.visible_rows)
         self.scrollbar.setValue(0)
-        
-        self.data_cache = DataCacheWorker(parser, total_rows)
-        self.data_cache.progress.connect(self._on_cache_progress)
-        self.data_cache.finished.connect(self._on_cache_finished)
-        self.data_cache.start()
-        
+
         self._update_visible_rows()
     
     def _on_cache_progress(self, current: int, total: int):
@@ -290,20 +286,7 @@ class VirtualScrollTable(QWidget):
                     item.setText('')
             return
         
-        data = None
-        if self.data_cache and self.data_cache.data_cache[logical_row]:
-            data = self.data_cache.data_cache[logical_row]
-        elif self.parser:
-            instr_info = self.parser.get_instruction_info(logical_row)
-            if instr_info:
-                data = {
-                    'num': str(logical_row + 1),
-                    'address': instr_info.address,
-                    'offset': instr_info.offset,
-                    'mnemonic': instr_info.mnemonic,
-                    'operands': instr_info.operands,
-                    'comment': instr_info.comment
-                }
+        data = self._get_row_data(logical_row)
         
         if not data:
             return
@@ -379,6 +362,24 @@ class VirtualScrollTable(QWidget):
     def get_selected_logical_row(self) -> int:
         """get_selected_logical_row function."""
         return self.selected_logical_row
+
+    def _get_row_data(self, logical_row: int) -> Optional[Dict]:
+        """Fetch visible-row data directly from the parser index."""
+        if logical_row < 0 or logical_row >= self.total_rows or not self.parser:
+            return None
+
+        instr_info = self.parser.get_instruction_info(logical_row, include_line_text=True)
+        if not instr_info:
+            return None
+
+        return {
+            'num': str(logical_row + 1),
+            'address': instr_info.address,
+            'offset': instr_info.offset,
+            'mnemonic': instr_info.mnemonic,
+            'operands': instr_info.operands,
+            'comment': instr_info.comment
+        }
     
     _COPY_COL_WIDTHS = (6, 14, 10, 8, 40)
 
@@ -387,20 +388,7 @@ class VirtualScrollTable(QWidget):
         logical_row = self.selected_logical_row
         if logical_row < 0 or logical_row >= self.total_rows:
             return
-        data = None
-        if self.data_cache:
-            data = self.data_cache.get_row_data(logical_row)
-        if not data and self.parser:
-            instr_info = self.parser.get_instruction_info(logical_row)
-            if instr_info:
-                data = {
-                    'num': str(logical_row + 1),
-                    'address': instr_info.address,
-                    'offset': instr_info.offset,
-                    'mnemonic': instr_info.mnemonic,
-                    'operands': instr_info.operands,
-                    'comment': instr_info.comment
-                }
+        data = self._get_row_data(logical_row)
         if not data:
             return
         w_num, w_addr, w_offset, w_mnemonic, w_instr = self._COPY_COL_WIDTHS

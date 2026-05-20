@@ -1,77 +1,59 @@
 ================================================================================
-                    寄存器数据流分析追踪系统 (TraceAnalyzer)
+TraceAnalyzer README
 ================================================================================
 
+GitHub 展示版说明见 README.md。
+
 【简介】
-TraceAnalyzer 用于加载、解析和浏览 ARM64 指令执行日志，支持按指令查看寄存器
-状态变化、内存转储，以及追踪寄存器来源。采用虚拟滚动和后台缓存，可处理百万
-级指令日志。
+TraceAnalyzer 是一个 ARM64 执行日志分析工具，支持超大 trace 的加载、浏览、
+搜索和数据流分析。当前版本已经支持侧边索引、后台缓存、结果表独立窗口、
+数据全查、地址全查、指令全查、寄存器来源追踪、数据来源追踪和反向污点分析。
 
-【运行环境】
-- Python 3.8+
-- PySide6（Qt for Python）
-
-安装依赖：
-  pip install PySide6
+【主要特性】
+- 大文件按需解析，不再一次性读入整份日志
+- 侧边索引复用，二次打开同一份 trace 明显加快
+- 支持：
+  - 查找（行号 / 指令地址 / 模块偏移 / 助记符）
+  - 地址全查
+  - 指令全查
+  - 数据全查（例如 0x746d2a63）
+  - 寄存器来源追踪
+  - 数据来源追踪
+  - 反向污点分析
+- 结果表支持独立窗口、双击跳转、复制选中、复制全部、全选
 
 【启动方式】
-1. 进入 TraceAnalyzer 目录
-2. Windows: 双击 run.bat 或命令行执行 python main.py
-   Linux/macOS: 执行 ./run.sh 或 python3 main.py
+- Windows: run.bat
+- Linux/macOS: run.sh
+- 也可以直接执行 python main.py
 
-【使用说明】
-- 通过菜单或 Ctrl+O 打开 .txt 格式的指令日志文件
-- 左侧「指令执行序列」显示行号、地址、偏移、指令、操作数、注释
-- 点击某行指令后，右侧显示该指令执行后的寄存器状态和内存转储
-- 双击寄存器可追踪该寄存器的来源（PgUp 继续向上追踪，PgDn 返回历史）
-- Ctrl+F 聚焦搜索框，F3 搜索；支持按行号或地址/偏移搜索
-- 在指令表中选中一行后按 Ctrl+C，可复制整行数据（对齐格式）
--测试用例log.txt、test.txt
-【项目结构】
-TraceAnalyzer/
-  main.py            - 主窗口、加载流程、快捷键与导航
-  parser.py          - 日志解析（指令、寄存器变化、内存操作/转储）
-  lazy_parser.py     - 延迟解析：先建索引，再按需加载文件行与解析
-  register.py        - 寄存器与寄存器状态定义
-  register_calc.py   - 寄存器状态计算（依赖检查点）
-  cache_worker.py    - 后台检查点与范围缓存线程
-  instruction_view.py - 虚拟滚动指令表格、行数据缓存、复制整行
-  ui_components.py  - UI 组件与深色样式
-  run.bat / run.sh  - 启动脚本
+【打包】
+- build_exe.bat
+- build_exe.bat --onefile
 
-【日志格式】
-程序期望的文本格式大致为：
-- 以 "0x" 开头的指令行，包含地址、偏移、指令、操作数，可选 ";注释"
-- 支持 "Original SP:" 等元信息
-- 指令后可跟内存操作、内存转储等行（详见 parser.py / lazy_parser.py）
-【新增功能】
-搜索框可以命中“访存地址”，不再只匹配指令地址/偏移
-输入地址后可查找所有命中位置，不止第一个。
-支持前缀模糊匹配：例如输入 0xbfffeb0，会命中 0xbfffeb01 到 0xbfffeb0f（以及同前缀的其它地址）。
-结果会显示：
-行号
-指令地址
-访问类型（R/W/D/D*）
-内存地址
-对应数据（如 0x74 (W17=0x74)）
-在搜索框输入 ldr，会弹出“指令全查”列表。
-列表会展示所有匹配助记符的指令（默认前缀匹配，所以 ldr 会匹配 ldr/ldrb/ldrh/ldrsw...）。
-每条结果包含：行号、指令地址、助记符、完整指令、内存地址、数据。
-双击结果可直接跳到对应指令位置。
-直接点原来的“查找”按钮，如果输入是助记符（比如 ldr），也会自动走这个全量列表逻辑。
-已优化完成，“地址全查”和“指令全查”两个结果表都支持全选复制。
+【快捷键】
+- Ctrl+O：打开 trace
+- Ctrl+F：聚焦搜索框
+- F3：查找 / 下一个
+- Ctrl+Shift+F：地址全查
+- Ctrl+Shift+D：数据全查
+- Ctrl+Shift+M：指令全查
+- Ctrl+T：快速数据来源追踪
+- Ctrl+Shift+T：快速反向污点分析
+- PgUp：追踪寄存器来源
+- PgDn：返回历史
 
-现在可用的操作
+【侧边索引】
+程序会自动生成 .traceidx.* 文件用于复用：
+- .traceidx.dat / .traceidx.json
+- .traceidx.chk
+- .traceidx.mnx
+- .traceidx.rgx
+- .traceidx.mem
+- .traceidx.mwr
+- .traceidx.ofx / .traceidx.ofm
 
-Ctrl+A：全选结果行
-Ctrl+C：复制选中行（如果没选中任何行，会复制全部）
-右键菜单：
-复制选中
-复制全部
-全选
-右键寄存器进行污点追踪
-新增地址全查、指令全查
-【关联项目】
-https://github.com/jiqiu2022/vm-trace-release
-https://github.com/lxz-jiandan/TraceAnalyzer
+【说明】
+建议优先阅读 README.md，内容更完整，也更适合 GitHub 展示。
+
 ================================================================================

@@ -1,16 +1,73 @@
-"""main module."""
+﻿"""main module."""
+import os
 import sys
 import time
 import re
+import threading
+from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Callable, Any
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+CONFLICTING_PYTHON_PATH_MARKERS = (
+    "vector35\\binaryninja\\python",
+    "vector35\\binaryninja\\python3",
+)
+
+
+def _strip_conflicting_python_paths():
+    """Remove injected third-party Python paths that break PySide6 loading."""
+    cleaned = []
+    for entry in sys.path:
+        normalized = str(entry).replace("/", "\\").lower()
+        if any(marker in normalized for marker in CONFLICTING_PYTHON_PATH_MARKERS):
+            continue
+        cleaned.append(entry)
+    sys.path[:] = cleaned
+
+
+def _bootstrap_project_python():
+    """Re-exec with the project's virtualenv when available."""
+    _strip_conflicting_python_paths()
+
+    if __name__ != "__main__":
+        return
+
+    if os.environ.get("TRACE_ANALYZER_SKIP_VENV_BOOTSTRAP") == "1":
+        return
+
+    if os.name == "nt":
+        venv_python = PROJECT_ROOT / "venv" / "Scripts" / "python.exe"
+    else:
+        venv_python = PROJECT_ROOT / "venv" / "bin" / "python3"
+        if not venv_python.exists():
+            venv_python = PROJECT_ROOT / "venv" / "bin" / "python"
+
+    if not venv_python.exists():
+        return
+
+    current_python = Path(sys.executable).resolve() if sys.executable else None
+    target_python = venv_python.resolve()
+    if current_python == target_python:
+        return
+
+    os.environ.pop("PYTHONPATH", None)
+    os.environ.pop("PYTHONHOME", None)
+    os.execv(
+        str(target_python),
+        [str(target_python), str(PROJECT_ROOT / "main.py"), *sys.argv[1:]],
+    )
+
+
+_bootstrap_project_python()
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QFileDialog, QMessageBox, QMenu, QTableWidgetItem,
-    QAbstractItemView, QFrame, QLabel, QDialog, QTableWidget, QHeaderView
+    QAbstractItemView, QFrame, QLabel, QDialog, QTableWidget, QHeaderView, QTableView,
+    QPushButton
 )
-from PySide6.QtCore import Qt, Signal, QThread, QTimer
+from PySide6.QtCore import Qt, Signal, QThread, QTimer, QAbstractTableModel, QModelIndex, QSortFilterProxyModel
 from PySide6.QtGui import QColor, QKeySequence, QShortcut
 
 from parser import Instruction
@@ -26,21 +83,918 @@ class ParseThread(QThread):
     """ParseThread class."""
     finished = Signal(object, object)
     error = Signal(str)
-    file_loaded = Signal()
+    progress = Signal(int, int)
 
     def __init__(self, file_path: str):
         super().__init__()
         self.file_path = file_path
+
+    @staticmethod
+    def _estimate_checkpoint_interval(file_size: int) -> int:
+        """Use wider checkpoint spacing for multi-GB traces."""
+        gib = 1024 * 1024 * 1024
+        if file_size >= 16 * gib:
+            return 20000
+        if file_size >= 8 * gib:
+            return 10000
+        if file_size >= 2 * gib:
+            return 5000
+        if file_size >= 512 * 1024 * 1024:
+            return 2000
+        return 500
+
+    def _emit_progress(self, current: int, total: int):
+        self.progress.emit(current, total)
     
     def run(self):
         try:
             parser = LazyLogParser(self.file_path)
-            count, initial_sp = parser.build_index()
-            parser.load_file_lines()
-            self.file_loaded.emit()
+            file_size = Path(self.file_path).stat().st_size
+            checkpoint_interval = self._estimate_checkpoint_interval(file_size)
+            _, initial_sp = parser.build_index(
+                progress_callback=self._emit_progress,
+                checkpoint_interval=checkpoint_interval,
+            )
             self.finished.emit(parser, initial_sp)
         except Exception as e:
             self.error.emit(str(e))
+
+
+class SearchThread(QThread):
+    """Background search worker for large traces."""
+
+    finished = Signal(str, object)
+    error = Signal(str)
+    progress = Signal(int, int, str)
+
+    MODE_FIND_FIRST = "find_first"
+    MODE_ADDRESS_ALL = "address_all"
+    MODE_OFFSET_ALL = "offset_all"
+    MODE_MNEMONIC_ALL = "mnemonic_all"
+    MODE_DATA_ALL = "data_all"
+    MAX_RESULTS = None
+
+    def __init__(self, parser: LazyLogParser, mode: str, query: str, start_index: int = 0):
+        super().__init__()
+        self.parser = parser
+        self.mode = mode
+        self.query = query
+        self.start_index = max(0, start_index)
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    @staticmethod
+    def _normalize_address_text(value: str) -> str:
+        text = (value or "").strip().lower()
+        return text[2:] if text.startswith("0x") else text
+
+    @staticmethod
+    def _is_probable_address_query(search_text: str) -> bool:
+        text = (search_text or "").strip().lower()
+        if text.startswith("0x"):
+            text = text[2:]
+        return len(text) >= 4 and bool(re.fullmatch(r"[0-9a-f]+", text))
+
+    @staticmethod
+    def _is_probable_exact_instruction_address(search_text: str) -> bool:
+        text = (search_text or "").strip().lower()
+        if not text.startswith("0x"):
+            return False
+        body = text[2:]
+        return len(body) >= 8 and bool(re.fullmatch(r"[0-9a-f]+", body))
+
+    @staticmethod
+    def _is_probable_offset_query(search_text: str) -> bool:
+        text = (search_text or "").strip().lower()
+        if not text.startswith("0x"):
+            return False
+        body = text[2:]
+        return 0 < len(body) < 8 and bool(re.fullmatch(r"[0-9a-f]+", body))
+
+    @staticmethod
+    def _normalize_data_query(search_text: str) -> str:
+        text = (search_text or "").strip().lower()
+        if not text:
+            return ""
+        if re.fullmatch(r"[0-9a-f]+", text):
+            return f"0x{text}"
+        return text
+
+    @classmethod
+    def _data_query_tokens(cls, search_text: str) -> List[str]:
+        normalized = cls._normalize_data_query(search_text)
+        if not normalized:
+            return []
+
+        tokens: List[str] = [normalized]
+        if normalized.startswith("0x") and re.fullmatch(r"0x[0-9a-f]+", normalized):
+            body = normalized[2:]
+            if len(body) % 2 == 0 and body:
+                byte_groups = [body[i:i + 2] for i in range(0, len(body), 2)]
+                tokens.append(" ".join(byte_groups))
+            elif body:
+                tokens.append(body)
+
+        seen = set()
+        ordered: List[str] = []
+        for token in tokens:
+            key = token.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+        return ordered
+
+    @classmethod
+    def _data_match_scope(
+        cls,
+        search_text: str,
+        info,
+        instruction: Optional[Instruction],
+    ) -> str:
+        tokens = cls._data_query_tokens(search_text)
+        if not tokens:
+            return ""
+
+        compact_tokens = [token for token in tokens if " " not in token]
+        spaced_tokens = [token for token in tokens if " " in token]
+
+        scopes: List[str] = []
+
+        comment_text = (getattr(info, "comment", "") or "").lower()
+        if any(token in comment_text for token in compact_tokens):
+            scopes.append("寄存器/注释")
+
+        operands_text = (getattr(info, "operands", "") or "").lower()
+        if any(token in operands_text for token in compact_tokens):
+            scopes.append("操作数")
+
+        if instruction:
+            for op in instruction.memory_ops:
+                data_text = (op.data_value or "").lower()
+                if any(token in data_text for token in compact_tokens):
+                    scopes.append("内存数据")
+                    break
+
+            if instruction.memory_dump:
+                for dump_line in instruction.memory_dump:
+                    spaced = " ".join(dump_line.data).lower()
+                    compact = "".join(dump_line.data).lower()
+                    if any(token in spaced for token in spaced_tokens) or any(
+                        token in compact for token in compact_tokens if not token.startswith("0x")
+                    ):
+                        scopes.append("内存Dump")
+                        break
+
+            raw_line = (instruction.raw_line or "").lower()
+            if not scopes and any(token in raw_line for token in tokens):
+                scopes.append("原始行")
+
+        return " / ".join(scopes)
+
+    @staticmethod
+    def _format_address_for_display(address: str) -> str:
+        value = (address or "").strip().lower()
+        if not value:
+            return value
+        return value if value.startswith("0x") else f"0x{value}"
+
+    @staticmethod
+    def _address_sort_key(address: str) -> int:
+        normalized = SearchThread._normalize_address_text(address)
+        if normalized and re.fullmatch(r"[0-9a-f]+", normalized):
+            return int(normalized, 16)
+        return (1 << 63) - 1
+
+    @staticmethod
+    def _format_memory_value(raw_value: str) -> Tuple[str, str]:
+        if not raw_value:
+            return "?", ""
+
+        text = raw_value.strip()
+        assignments = list(re.finditer(r"\b([A-Za-z][\w.]*)\s*=\s*([^\s,]+)", text))
+        if not assignments:
+            token = text
+            if token.startswith("0x") or token.startswith("0X"):
+                token = token.lower()
+            return token, ""
+
+        values = []
+        for match in assignments:
+            token = match.group(2).strip()
+            if token.startswith("0x") or token.startswith("0X"):
+                token = token.lower()
+            values.append(token)
+        value_text = values[0] if len(values) == 1 else ", ".join(values)
+        return value_text, text
+
+    @staticmethod
+    def _is_memory_address_match(
+        instruction: Optional[Instruction],
+        search_lower: str,
+        search_addr: str,
+    ) -> bool:
+        if not instruction:
+            return False
+
+        def matches(candidate: str) -> bool:
+            value = (candidate or "").strip().lower()
+            if not value:
+                return False
+            if search_lower in value:
+                return True
+            if search_addr and search_addr in SearchThread._normalize_address_text(value):
+                return True
+            return False
+
+        for op in instruction.memory_ops:
+            if matches(op.address):
+                return True
+
+        for dump_line in instruction.memory_dump:
+            if matches(dump_line.address):
+                return True
+
+        return False
+
+    def _instruction_matches_search(
+        self,
+        index: int,
+        search_lower: str,
+        search_addr: str,
+        enable_memory_addr_search: bool,
+    ) -> bool:
+        info = self.parser.get_instruction_info(index)
+        if info and (
+            search_lower in info.address.lower() or search_lower in info.offset.lower()
+        ):
+            return True
+
+        if not enable_memory_addr_search:
+            return False
+
+        instruction = self.parser.parse_instruction_at(index)
+        return self._is_memory_address_match(instruction, search_lower, search_addr)
+
+    @staticmethod
+    def _build_instruction_memory_summary(
+        instruction: Optional[Instruction],
+        fallback_text: str = "",
+    ) -> Tuple[str, str]:
+        if not instruction:
+            detail_text = (fallback_text or "").strip()
+            return "-", detail_text if detail_text else "-"
+
+        if instruction.memory_ops:
+            addresses: List[str] = []
+            data_items: List[str] = []
+            for op in instruction.memory_ops[:3]:
+                addresses.append(SearchThread._format_address_for_display(op.address))
+                value, detail = SearchThread._format_memory_value(op.data_value)
+                text = value if not detail or detail == value else f"{value} ({detail})"
+                data_items.append(f"{'R' if op.type == 'read' else 'W'}:{text}")
+            if len(instruction.memory_ops) > 3:
+                addresses.append("...")
+                data_items.append("...")
+            return ", ".join(addresses), " | ".join(data_items)
+
+        if instruction.memory_dump:
+            addresses = [
+                SearchThread._format_address_for_display(d.address)
+                for d in instruction.memory_dump[:3]
+            ]
+            if len(instruction.memory_dump) > 3:
+                addresses.append("...")
+            first_dump = instruction.memory_dump[0]
+            dump_hex = " ".join(first_dump.data[:16])
+            if len(first_dump.data) > 16:
+                dump_hex += " ..."
+            return ", ".join(addresses), dump_hex if dump_hex else "-"
+
+        detail_text = (fallback_text or "").strip()
+        return "-", detail_text if detail_text else "-"
+
+    def _emit_progress(self, current: int, total: int, text: str):
+        self.progress.emit(current, total, text)
+
+    def _progress_due(self, index: int, step: int = 50000) -> bool:
+        return index == 0 or index % step == 0
+
+    def _find_first_match(self) -> Dict:
+        total = self.parser.get_instruction_count()
+        search_lower = self.query.lower()
+        search_addr = self._normalize_address_text(self.query)
+        enable_memory_addr_search = self._is_probable_address_query(self.query)
+
+        if self._is_probable_exact_instruction_address(self.query):
+            self._emit_progress(0, 1, f"正在定位地址: {self.query}")
+            direct_index = self.parser.find_next_instruction_index_by_address(
+                self.query,
+                self.start_index,
+            )
+            if direct_index >= 0:
+                self._emit_progress(1, 1, f"地址定位完成: {self.query}")
+                return {"query": self.query, "found_index": direct_index, "cancelled": False}
+
+        if search_lower.startswith("0x") and hasattr(self.parser, "find_next_instruction_index_by_offset"):
+            self._emit_progress(0, 1, f"正在定位偏移: {self.query}")
+            direct_offset_index = self.parser.find_next_instruction_index_by_offset(
+                self.query,
+                self.start_index,
+            )
+            if direct_offset_index >= 0:
+                self._emit_progress(1, 1, f"偏移定位完成: {self.query}")
+                return {
+                    "query": self.query,
+                    "found_index": direct_offset_index,
+                    "cancelled": False,
+                }
+
+        if enable_memory_addr_search and hasattr(self.parser, "find_next_instruction_index_by_memory_address"):
+            self._emit_progress(0, 1, f"正在定位内存地址: {self.query}")
+            direct_memory_index = self.parser.find_next_instruction_index_by_memory_address(
+                self.query,
+                self.start_index,
+            )
+            if direct_memory_index >= 0:
+                self._emit_progress(1, 1, f"内存地址定位完成: {self.query}")
+                return {
+                    "query": self.query,
+                    "found_index": direct_memory_index,
+                    "cancelled": False,
+                }
+
+            if search_lower.startswith("0x"):
+                self._emit_progress(1, 1, f"搜索完成: {self.query}")
+                return {
+                    "query": self.query,
+                    "found_index": -1,
+                    "cancelled": False,
+                    "hint": (
+                        "未在完整指令地址、模块偏移或索引化的内存地址中找到匹配。"
+                        "短十六进制查询不再回扫整份文件；如需内存地址列表请使用“地址全查”，"
+                        "如需模块偏移请继续使用当前“查找”，如需指令地址请输入更完整的 0x 地址。"
+                    ),
+                }
+
+        ranges = [
+            (self.start_index, total),
+            (0, min(self.start_index, total)),
+        ]
+
+        scanned = 0
+        for range_start, range_end in ranges:
+            for i in range(range_start, range_end):
+                if self._cancelled:
+                    return {"query": self.query, "found_index": -1, "cancelled": True}
+                if self._progress_due(scanned):
+                    self._emit_progress(scanned, total, f"正在搜索: {self.query}")
+                if self._instruction_matches_search(
+                    i,
+                    search_lower,
+                    search_addr,
+                    enable_memory_addr_search,
+                ):
+                    self._emit_progress(total, total, f"搜索完成: {self.query}")
+                    return {"query": self.query, "found_index": i, "cancelled": False}
+                scanned += 1
+
+        self._emit_progress(total, total, f"搜索完成: {self.query}")
+        return {"query": self.query, "found_index": -1, "cancelled": False}
+
+    def _collect_address_matches(self) -> Dict:
+        total = self.parser.get_instruction_count()
+        query_norm = self._normalize_address_text(self.query)
+        if not query_norm or not re.fullmatch(r"[0-9a-f]+", query_norm):
+            return {"query": self.query, "matches": [], "cancelled": False, "truncated": False}
+
+        if hasattr(self.parser, "iter_memory_records_for_address_prefix"):
+            candidate_total = total
+            if hasattr(self.parser, "estimate_memory_record_candidates"):
+                candidate_total = max(
+                    1,
+                    int(self.parser.estimate_memory_record_candidates(self.query)),
+                )
+
+            matches: List[Dict] = []
+            truncated = False
+            processed = 0
+            kind_read = int(getattr(self.parser, "MEMORY_KIND_READ", 0))
+            kind_write = int(getattr(self.parser, "MEMORY_KIND_WRITE", 1))
+            kind_dump = int(getattr(self.parser, "MEMORY_KIND_DUMP", 2))
+            kind_dump_modified = int(getattr(self.parser, "MEMORY_KIND_DUMP_MODIFIED", 3))
+
+            for instruction_index, _address_value, _data_size, kind, slot in (
+                self.parser.iter_memory_records_for_address_prefix(
+                    self.query,
+                    limit=self.MAX_RESULTS,
+                )
+            ):
+                if self._cancelled:
+                    return {
+                        "query": self.query,
+                        "matches": matches,
+                        "cancelled": True,
+                        "truncated": truncated,
+                    }
+                if self._progress_due(processed, step=5000):
+                    self._emit_progress(processed, candidate_total, f"正在全量搜索地址: {self.query}")
+
+                instruction = self.parser.parse_instruction_at(instruction_index)
+                if not instruction:
+                    processed += 1
+                    continue
+
+                line_no = instruction_index + 1
+                instr_addr = self._format_address_for_display(instruction.address)
+
+                if kind in (kind_read, kind_write):
+                    if slot >= len(instruction.memory_ops):
+                        processed += 1
+                        continue
+                    op = instruction.memory_ops[slot]
+                    if not self._normalize_address_text(op.address).startswith(query_norm):
+                        processed += 1
+                        continue
+
+                    value, detail = self._format_memory_value(op.data_value)
+                    data_text = value if not detail or detail == value else f"{value} ({detail})"
+                    matches.append({
+                        "index": instruction_index,
+                        "line": line_no,
+                        "instruction_address": instr_addr,
+                        "access": "R" if kind == kind_read else "W",
+                        "memory_address": self._format_address_for_display(op.address),
+                        "data": data_text,
+                    })
+                elif kind in (kind_dump, kind_dump_modified):
+                    if slot >= len(instruction.memory_dump):
+                        processed += 1
+                        continue
+                    dump_line = instruction.memory_dump[slot]
+                    if not self._normalize_address_text(dump_line.address).startswith(query_norm):
+                        processed += 1
+                        continue
+
+                    matches.append({
+                        "index": instruction_index,
+                        "line": line_no,
+                        "instruction_address": instr_addr,
+                        "access": "D*" if kind == kind_dump_modified else "D",
+                        "memory_address": self._format_address_for_display(dump_line.address),
+                        "data": " ".join(dump_line.data),
+                    })
+
+                processed += 1
+                if self.MAX_RESULTS is not None and len(matches) >= self.MAX_RESULTS:
+                    truncated = True
+                    break
+
+            matches.sort(
+                key=lambda item: (
+                    self._address_sort_key(item["memory_address"]),
+                    self._address_sort_key(item["instruction_address"]),
+                    int(item["line"]),
+                    item["access"],
+                ),
+            )
+            self._emit_progress(candidate_total, candidate_total, f"地址搜索完成: {self.query}")
+            return {
+                "query": self.query,
+                "matches": matches,
+                "cancelled": False,
+                "truncated": truncated,
+            }
+
+        matches: List[Dict] = []
+        truncated = False
+        for i in range(total):
+            if self._cancelled:
+                return {"query": self.query, "matches": matches, "cancelled": True, "truncated": truncated}
+            if self._progress_due(i):
+                self._emit_progress(i, total, f"正在全量搜索地址: {self.query}")
+
+            instruction = self.parser.parse_instruction_at(i)
+            if not instruction:
+                continue
+
+            line_no = i + 1
+            instr_addr = self._format_address_for_display(instruction.address)
+
+            for op in instruction.memory_ops:
+                if not self._normalize_address_text(op.address).startswith(query_norm):
+                    continue
+
+                value, detail = self._format_memory_value(op.data_value)
+                data_text = value
+                if detail and detail != value:
+                    data_text = f"{value} ({detail})"
+
+                matches.append({
+                    "index": i,
+                    "line": line_no,
+                    "instruction_address": instr_addr,
+                    "access": "R" if op.type == "read" else "W",
+                    "memory_address": self._format_address_for_display(op.address),
+                    "data": data_text,
+                })
+                if self.MAX_RESULTS is not None and len(matches) >= self.MAX_RESULTS:
+                    truncated = True
+                    break
+
+            if truncated:
+                break
+
+            for dump_line in instruction.memory_dump:
+                if not self._normalize_address_text(dump_line.address).startswith(query_norm):
+                    continue
+
+                matches.append({
+                    "index": i,
+                    "line": line_no,
+                    "instruction_address": instr_addr,
+                    "access": "D*" if dump_line.is_modified else "D",
+                    "memory_address": self._format_address_for_display(dump_line.address),
+                    "data": " ".join(dump_line.data),
+                })
+                if self.MAX_RESULTS is not None and len(matches) >= self.MAX_RESULTS:
+                    truncated = True
+                    break
+
+            if truncated:
+                break
+
+        matches.sort(
+            key=lambda item: (
+                self._address_sort_key(item["memory_address"]),
+                self._address_sort_key(item["instruction_address"]),
+                int(item["line"]),
+                item["access"],
+            ),
+        )
+        self._emit_progress(total, total, f"地址搜索完成: {self.query}")
+        return {
+            "query": self.query,
+            "matches": matches,
+            "cancelled": False,
+            "truncated": truncated,
+        }
+
+    def _collect_offset_matches(self) -> Dict:
+        query_norm = self._format_address_for_display(self.query)
+        matches: List[Dict] = []
+        truncated = False
+
+        if hasattr(self.parser, "iter_instruction_indices_by_offset"):
+            self._emit_progress(0, 0, f"正在全量搜索偏移: {query_norm}")
+            for hit_count, instruction_index in enumerate(
+                self.parser.iter_instruction_indices_by_offset(self.query),
+                start=1,
+            ):
+                if self._cancelled:
+                    return {
+                        "query": query_norm,
+                        "matches": matches,
+                        "cancelled": True,
+                        "truncated": truncated,
+                    }
+                if hit_count == 1 or hit_count % 5000 == 0:
+                    self._emit_progress(
+                        0,
+                        0,
+                        f"正在全量搜索偏移: {query_norm} (已找到 {len(matches)} 条)",
+                    )
+
+                info = self.parser.get_instruction_info(instruction_index, include_line_text=True)
+                if not info:
+                    continue
+
+                instruction = self.parser.parse_instruction_at(instruction_index)
+                mem_addr, mem_data = self._build_instruction_memory_summary(
+                    instruction,
+                    info.comment,
+                )
+                matches.append({
+                    "index": instruction_index,
+                    "line": instruction_index + 1,
+                    "instruction_address": self._format_address_for_display(info.address),
+                    "offset": self._format_address_for_display(info.offset),
+                    "mnemonic": info.mnemonic,
+                    "instruction_text": f"{info.mnemonic} {info.operands}".strip(),
+                    "memory_address": mem_addr,
+                    "data": mem_data,
+                })
+                if self.MAX_RESULTS is not None and len(matches) >= self.MAX_RESULTS:
+                    truncated = True
+                    break
+
+            self._emit_progress(
+                max(1, len(matches)),
+                max(1, len(matches)),
+                f"偏移搜索完成: {query_norm}",
+            )
+            return {
+                "query": query_norm,
+                "matches": matches,
+                "cancelled": False,
+                "truncated": truncated,
+            }
+
+        total = self.parser.get_instruction_count()
+        for i in range(total):
+            if self._cancelled:
+                return {
+                    "query": query_norm,
+                    "matches": matches,
+                    "cancelled": True,
+                    "truncated": truncated,
+                }
+            if self._progress_due(i):
+                self._emit_progress(i, total, f"正在全量搜索偏移: {query_norm}")
+
+            info = self.parser.get_instruction_info(i)
+            if not info or (info.offset or "").lower() != query_norm.lower():
+                continue
+
+            full_info = self.parser.get_instruction_info(i, include_line_text=True)
+            if not full_info:
+                continue
+
+            instruction = self.parser.parse_instruction_at(i)
+            mem_addr, mem_data = self._build_instruction_memory_summary(
+                instruction,
+                full_info.comment,
+            )
+            matches.append({
+                "index": i,
+                "line": i + 1,
+                "instruction_address": self._format_address_for_display(full_info.address),
+                "offset": self._format_address_for_display(full_info.offset),
+                "mnemonic": full_info.mnemonic,
+                "instruction_text": f"{full_info.mnemonic} {full_info.operands}".strip(),
+                "memory_address": mem_addr,
+                "data": mem_data,
+            })
+            if self.MAX_RESULTS is not None and len(matches) >= self.MAX_RESULTS:
+                truncated = True
+                break
+
+        self._emit_progress(total, total, f"偏移搜索完成: {query_norm}")
+        return {
+            "query": query_norm,
+            "matches": matches,
+            "cancelled": False,
+            "truncated": truncated,
+        }
+
+    def _collect_mnemonic_matches(self) -> Dict:
+        query = (self.query or "").strip().lower()
+        if query.endswith("*"):
+            query = query[:-1]
+        if not query:
+            return {
+                "query": self.query,
+                "matches": [],
+                "count": 0,
+                "cancelled": False,
+                "truncated": False,
+                "lazy": True,
+            }
+
+        self._emit_progress(0, 1, f"正在统计指令搜索结果: {self.query}")
+        count = 0
+        if hasattr(self.parser, "count_instruction_indices_for_mnemonic_prefix"):
+            count = int(self.parser.count_instruction_indices_for_mnemonic_prefix(query))
+        elif hasattr(self.parser, "iter_instruction_indices_for_mnemonic_prefix"):
+            for count, _instruction_index in enumerate(
+                self.parser.iter_instruction_indices_for_mnemonic_prefix(query),
+                start=1,
+            ):
+                if self._cancelled:
+                    return {
+                        "query": self.query,
+                        "matches": [],
+                        "count": 0,
+                        "cancelled": True,
+                        "truncated": False,
+                        "lazy": True,
+                    }
+
+        self._emit_progress(1, 1, f"指令搜索完成: {self.query}")
+        return {
+            "query": self.query,
+            "matches": [],
+            "count": count,
+            "cancelled": False,
+            "truncated": False,
+            "lazy": True,
+        }
+
+    def _collect_data_matches(self) -> Dict:
+        query_norm = self._normalize_data_query(self.query)
+        if not query_norm:
+            return {"query": self.query, "matches": [], "cancelled": False, "truncated": False}
+
+        matches: List[Dict] = []
+        truncated = False
+        tokens = self._data_query_tokens(self.query)
+
+        if hasattr(self.parser, "iter_instruction_indices_by_text_tokens"):
+            self._emit_progress(0, 0, f"正在全量搜索数据: {query_norm}")
+            processed = 0
+            for instruction_index in self.parser.iter_instruction_indices_by_text_tokens(
+                tokens,
+                limit=self.MAX_RESULTS,
+            ):
+                if self._cancelled:
+                    return {
+                        "query": query_norm,
+                        "matches": matches,
+                        "cancelled": True,
+                        "truncated": truncated,
+                    }
+                if processed == 0 or processed % 5000 == 0:
+                    self._emit_progress(
+                        0,
+                        0,
+                        f"正在全量搜索数据: {query_norm} (已找到 {len(matches)} 条)",
+                    )
+
+                full_info = self.parser.get_instruction_info(instruction_index, include_line_text=True)
+                if not full_info:
+                    processed += 1
+                    continue
+
+                instruction = self.parser.parse_instruction_at(instruction_index)
+                match_scope = self._data_match_scope(self.query, full_info, instruction)
+                if not match_scope:
+                    processed += 1
+                    continue
+
+                mem_addr, detail = self._build_instruction_memory_summary(
+                    instruction,
+                    full_info.comment,
+                )
+                matches.append({
+                    "index": instruction_index,
+                    "line": instruction_index + 1,
+                    "instruction_address": self._format_address_for_display(full_info.address),
+                    "offset": self._format_address_for_display(full_info.offset),
+                    "mnemonic": full_info.mnemonic,
+                    "instruction_text": f"{full_info.mnemonic} {full_info.operands}".strip(),
+                    "match_scope": match_scope,
+                    "memory_address": mem_addr,
+                    "data": detail,
+                })
+                processed += 1
+
+                if self.MAX_RESULTS is not None and len(matches) >= self.MAX_RESULTS:
+                    truncated = True
+                    break
+
+            matches.sort(
+                key=lambda item: (
+                    int(item["line"]),
+                    self._address_sort_key(item["instruction_address"]),
+                ),
+            )
+            self._emit_progress(max(1, len(matches)), max(1, len(matches)), f"数据搜索完成: {query_norm}")
+            return {
+                "query": query_norm,
+                "matches": matches,
+                "cancelled": False,
+                "truncated": truncated,
+            }
+
+        total = self.parser.get_instruction_count()
+        for i in range(total):
+            if self._cancelled:
+                return {
+                    "query": query_norm,
+                    "matches": matches,
+                    "cancelled": True,
+                    "truncated": truncated,
+                }
+            if self._progress_due(i):
+                self._emit_progress(i, total, f"正在全量搜索数据: {query_norm}")
+
+            full_info = self.parser.get_instruction_info(i, include_line_text=True)
+            if not full_info:
+                continue
+
+            instruction = self.parser.parse_instruction_at(i)
+            match_scope = self._data_match_scope(self.query, full_info, instruction)
+            if not match_scope:
+                continue
+
+            mem_addr, detail = self._build_instruction_memory_summary(
+                instruction,
+                full_info.comment,
+            )
+            matches.append({
+                "index": i,
+                "line": i + 1,
+                "instruction_address": self._format_address_for_display(full_info.address),
+                "offset": self._format_address_for_display(full_info.offset),
+                "mnemonic": full_info.mnemonic,
+                "instruction_text": f"{full_info.mnemonic} {full_info.operands}".strip(),
+                "match_scope": match_scope,
+                "memory_address": mem_addr,
+                "data": detail,
+            })
+            if self.MAX_RESULTS is not None and len(matches) >= self.MAX_RESULTS:
+                truncated = True
+                break
+
+        self._emit_progress(total, total, f"数据搜索完成: {query_norm}")
+        return {
+            "query": query_norm,
+            "matches": matches,
+            "cancelled": False,
+            "truncated": truncated,
+        }
+
+    def run(self):
+        try:
+            if self.mode == self.MODE_FIND_FIRST:
+                result = self._find_first_match()
+            elif self.mode == self.MODE_ADDRESS_ALL:
+                result = self._collect_address_matches()
+            elif self.mode == self.MODE_OFFSET_ALL:
+                result = self._collect_offset_matches()
+            elif self.mode == self.MODE_MNEMONIC_ALL:
+                result = self._collect_mnemonic_matches()
+            elif self.mode == self.MODE_DATA_ALL:
+                result = self._collect_data_matches()
+            else:
+                raise ValueError(f"Unknown search mode: {self.mode}")
+
+            self.finished.emit(self.mode, result)
+        except Exception as exc:
+            if not self._cancelled:
+                self.error.emit(str(exc))
+
+
+class AnalysisThread(QThread):
+    """Background worker for register-centric analyses."""
+
+    finished = Signal(str, object)
+    error = Signal(str)
+
+    MODE_TRACE_SOURCE = "trace_source"
+    MODE_REVERSE_TAINT = "reverse_taint"
+    MODE_DATA_PROVENANCE = "data_provenance"
+
+    def __init__(
+        self,
+        parser: LazyLogParser,
+        cache_worker: CacheWorker,
+        mode: str,
+        register: str,
+        from_index: int,
+    ):
+        super().__init__()
+        self.parser = parser
+        self.cache_worker = cache_worker
+        self.mode = mode
+        self.register = register
+        self.from_index = from_index
+
+    def run(self):
+        try:
+            calc = RegisterCalculator(self.parser, self.cache_worker)
+            if self.mode == self.MODE_TRACE_SOURCE:
+                result = {
+                    "register": self.register,
+                    "source_index": calc.trace_register_source(self.register, self.from_index),
+                }
+            elif self.mode == self.MODE_REVERSE_TAINT:
+                result = {
+                    "register": self.register,
+                    "chain": calc.reverse_taint_trace(
+                        self.register,
+                        self.from_index,
+                        max_steps=500,
+                    ),
+                }
+            elif self.mode == self.MODE_DATA_PROVENANCE:
+                result = {
+                    "register": self.register,
+                    "trace_result": calc.trace_data_provenance(
+                        self.register,
+                        self.from_index,
+                        max_scan=30000,
+                        max_calc_steps=160,
+                    ),
+                }
+            else:
+                raise ValueError(f"Unknown analysis mode: {self.mode}")
+
+            self.finished.emit(self.mode, result)
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 class SortableTableWidgetItem(QTableWidgetItem):
@@ -56,6 +1010,128 @@ class SortableTableWidgetItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+class SearchResultsTableModel(QAbstractTableModel):
+    """Lightweight table model for large search result sets."""
+
+    def __init__(self, columns: List[Dict[str, Any]], rows, parent=None):
+        super().__init__(parent)
+        self._columns = columns
+        self._rows = rows if isinstance(rows, list) else None
+        self._row_source = None if isinstance(rows, list) else rows
+        self._row_cache: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
+        self._row_cache_max_size = 2048
+
+    def _resolve_row(self, row_index: int) -> Dict[str, Any]:
+        if self._rows is not None:
+            return self._rows[row_index]
+
+        cached = self._row_cache.get(row_index)
+        if cached is not None:
+            self._row_cache.move_to_end(row_index)
+            return cached
+
+        row = self._row_source.row_at(row_index)
+        self._row_cache[row_index] = row
+        self._row_cache.move_to_end(row_index)
+        while len(self._row_cache) > self._row_cache_max_size:
+            self._row_cache.popitem(last=False)
+        return row
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        if self._rows is not None:
+            return len(self._rows)
+        return self._row_source.row_count()
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._columns)
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+        if not index.isValid():
+            return None
+
+        row = self._resolve_row(index.row())
+        column = self._columns[index.column()]
+        display_fn: Callable[[Dict[str, Any]], Any] = column["display"]
+        sort_fn: Callable[[Dict[str, Any]], Any] = column["sort"]
+
+        if role == Qt.DisplayRole:
+            value = display_fn(row)
+            return "" if value is None else str(value)
+        if role == Qt.UserRole:
+            return sort_fn(row)
+        return None
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.DisplayRole):
+        if role != Qt.DisplayRole:
+            return None
+        if orientation == Qt.Horizontal:
+            return self._columns[section]["header"]
+        return str(section + 1)
+
+    def instruction_index_at(self, row: int) -> int:
+        if row < 0 or row >= self.rowCount():
+            return -1
+        try:
+            return int(self._resolve_row(row).get("index", -1))
+        except (TypeError, ValueError):
+            return -1
+
+
+class MnemonicSearchResultsSource:
+    """Lazy row source for very large mnemonic search result sets."""
+
+    def __init__(self, parser: LazyLogParser, query: str):
+        self.parser = parser
+        self.query = query
+        self._count = parser.count_instruction_indices_for_mnemonic_prefix(query)
+        self._cache: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
+        self._cache_max_size = 4096
+
+    def row_count(self) -> int:
+        return self._count
+
+    def row_at(self, row_index: int) -> Dict[str, Any]:
+        cached = self._cache.get(row_index)
+        if cached is not None:
+            self._cache.move_to_end(row_index)
+            return cached
+
+        instruction_index = self.parser.get_instruction_index_for_mnemonic_prefix_position(
+            self.query,
+            row_index,
+        )
+        if instruction_index < 0:
+            return {}
+
+        full_info = self.parser.get_instruction_info(instruction_index, include_line_text=True)
+        if not full_info:
+            return {}
+
+        instruction = self.parser.parse_instruction_at(instruction_index)
+        mem_addr, mem_data = SearchThread._build_instruction_memory_summary(
+            instruction,
+            full_info.comment,
+        )
+        row = {
+            "index": instruction_index,
+            "line": instruction_index + 1,
+            "instruction_address": MainWindow._format_address_for_display(full_info.address),
+            "mnemonic": full_info.mnemonic,
+            "instruction_text": f"{full_info.mnemonic} {full_info.operands}".strip(),
+            "memory_address": mem_addr,
+            "data": mem_data,
+        }
+        self._cache[row_index] = row
+        self._cache.move_to_end(row_index)
+        while len(self._cache) > self._cache_max_size:
+            self._cache.popitem(last=False)
+        return row
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -68,6 +1144,10 @@ class MainWindow(QMainWindow):
         self.register_calc: Optional[RegisterCalculator] = None
         
         self.parse_thread: Optional[ParseThread] = None
+        self.search_thread: Optional[SearchThread] = None
+        self.analysis_thread: Optional[AnalysisThread] = None
+        self.offset_warmup_thread: Optional[threading.Thread] = None
+        self.open_dialogs: List[QDialog] = []
         
         
         self.instruction_view: Optional[InstructionViewController] = None
@@ -86,8 +1166,49 @@ class MainWindow(QMainWindow):
         self.virtual_table: Optional[VirtualScrollTable] = None
         self.register_table = None
         self.memory_display = None
+        self.current_file_path: Optional[str] = None
+        self.sorted_registers = sorted(
+            RegisterCalculator.get_all_arm64_registers(),
+            key=RegisterCalculator.get_register_sort_key,
+        )
         
         self.init_ui()
+
+    @staticmethod
+    def _dispose_dialog(dialog: QDialog, table: Optional[QAbstractItemView] = None):
+        """Release large table dialogs promptly after they close."""
+        if table is not None:
+            try:
+                if isinstance(table, QTableWidget):
+                    table.setSortingEnabled(False)
+                    table.clearContents()
+                    table.setRowCount(0)
+                elif hasattr(table, "setModel"):
+                    table.setModel(None)
+            except RuntimeError:
+                pass
+        try:
+            dialog.deleteLater()
+        except RuntimeError:
+            pass
+
+    def _show_persistent_dialog(self, dialog: QDialog, table: Optional[QAbstractItemView] = None):
+        """Show a modeless dialog and keep it alive until the user closes it."""
+        dialog.setModal(False)
+        dialog.setWindowModality(Qt.NonModal)
+        self.open_dialogs.append(dialog)
+
+        def on_finished(_result: int, current_dialog=dialog, current_table=table):
+            try:
+                self.open_dialogs.remove(current_dialog)
+            except ValueError:
+                pass
+            self._dispose_dialog(current_dialog, current_table)
+
+        dialog.finished.connect(on_finished)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
     
     def init_ui(self):
         self.setWindowTitle('TraceAnalyzer')
@@ -107,6 +1228,12 @@ class MainWindow(QMainWindow):
             'search_all': self.search_all_addresses,
             'search_mnemonic': self.search_instructions_by_mnemonic
         })
+        self.search_input.setPlaceholderText("行号/地址/偏移/指令/数据...")
+        data_search_btn = QPushButton("数据全查")
+        data_search_btn.setMaximumHeight(26)
+        data_search_btn.setMaximumWidth(110)
+        data_search_btn.clicked.connect(self.search_data_values)
+        toolbar.layout().insertWidget(7, data_search_btn)
         main_layout.addWidget(toolbar)
         
         
@@ -174,27 +1301,36 @@ class MainWindow(QMainWindow):
         
         
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         self.status_label.setText(f"正在建立索引: {Path(file_path).name}...")
         self.setEnabled(False)
+        self.current_file_path = file_path
         
         self.parse_thread = ParseThread(file_path)
         self.parse_thread.finished.connect(self.on_parse_finished)
         self.parse_thread.error.connect(self.on_parse_error)
-        self.parse_thread.file_loaded.connect(self.on_file_lines_loaded)
+        self.parse_thread.progress.connect(self.on_parse_progress)
         self.parse_thread.start()
     
     def _cleanup(self):
         """_cleanup function."""
+        self._stop_search_thread()
+        self._stop_analysis_thread()
+
         if self.cache_worker:
             self.cache_worker.stop()
             self.cache_worker = None
+
+        if self.parser:
+            self.parser.close()
         
         self.parser = None
         self.instruction_count = 0
         self.selected_index = -1
         self.history.clear()
         self.history_index = -1
+        self.current_file_path = None
         
         if self.register_table:
             self.register_table.setRowCount(0)
@@ -211,18 +1347,20 @@ class MainWindow(QMainWindow):
         self.initial_sp = initial_sp
         
         
-        self.cache_worker = CacheWorker(parser, checkpoint_interval=500)
+        self.cache_worker = CacheWorker(parser)
         self.cache_worker.checkpoint_ready.connect(self.on_checkpoint_ready)
         self.cache_worker.progress.connect(self.on_cache_progress)
         self.cache_worker.all_checkpoints_ready.connect(self.on_all_checkpoints_ready)
         
         
         self.register_calc = RegisterCalculator(parser, self.cache_worker)
-        
+        self._start_offset_postings_warmup(parser)
+
         self.instruction_view.set_parser(parser, self.instruction_count)
         
         self.stats_label.setText(f'Total {self.instruction_count:,} instructions')
-        
+        QTimer.singleShot(10, self.delayed_update_table)
+
     def on_parse_error(self, error_msg: str):
         """on_parse_error function."""
         QMessageBox.critical(self, "错误", f"解析文件失败: {error_msg}")
@@ -230,19 +1368,287 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.status_label.setText("加载失败")
 
-    def on_file_lines_loaded(self):
-        """on_file_lines_loaded function."""
-        QTimer.singleShot(10, self.delayed_update_table)
+    def on_parse_progress(self, current: int, total: int):
+        """Update visible load progress for large files."""
+        if total <= 0:
+            self.progress_bar.setRange(0, 0)
+            return
+
+        percent = max(0, min(100, int(current * 100 / total)))
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(percent)
+
+        file_name = Path(self.current_file_path).name if self.current_file_path else "trace"
+        current_mb = current / (1024 * 1024)
+        total_mb = total / (1024 * 1024)
+        self.status_label.setText(
+            f"正在建立索引: {file_name} ({percent}%, {current_mb:.0f}/{total_mb:.0f} MB)"
+        )
+
     def delayed_update_table(self):
         """delayed_update_table function."""
         self.instruction_view.initialize_table(500)
+
+        if self.cache_worker and self.cache_worker.get_checkpoint_count() == 0:
+            self.cache_worker.start_building_checkpoints()
 
         self.status_label.setText("就绪")
 
         self.progress_bar.setVisible(False)
         self.setEnabled(True)
 
-        self.cache_worker.start_building_checkpoints()
+    def _start_offset_postings_warmup(self, parser: LazyLogParser):
+        """Warm exact-offset postings in the background when missing."""
+        if not hasattr(parser, "has_offset_postings_sidecar"):
+            return
+        if parser.has_offset_postings_sidecar():
+            return
+
+        def worker():
+            try:
+                parser._ensure_offset_postings(force_build=True)
+            except Exception:
+                pass
+
+        self.offset_warmup_thread = threading.Thread(
+            target=worker,
+            name="offset-postings-warmup",
+            daemon=True,
+        )
+        self.offset_warmup_thread.start()
+
+    def _stop_search_thread(self):
+        """Cancel any in-flight background search."""
+        if self.search_thread:
+            self.search_thread.cancel()
+            self.search_thread.wait()
+            self.search_thread.deleteLater()
+            self.search_thread = None
+
+    def _stop_analysis_thread(self):
+        """Wait for any in-flight analysis worker to finish."""
+        if self.analysis_thread:
+            self.analysis_thread.wait()
+            self.analysis_thread.deleteLater()
+            self.analysis_thread = None
+
+    def _start_search_thread(self, mode: str, query: str, start_index: int = 0):
+        """Launch a background search for large trace scans."""
+        self._stop_search_thread()
+
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+
+        self.search_thread = SearchThread(self.parser, mode, query, start_index)
+        self.search_thread.progress.connect(self.on_search_progress)
+        self.search_thread.finished.connect(self.on_search_finished)
+        self.search_thread.error.connect(self.on_search_error)
+        self.search_thread.start()
+
+    def on_search_progress(self, current: int, total: int, text: str):
+        """Update progress for background searches."""
+        if total <= 0:
+            self.progress_bar.setRange(0, 0)
+        else:
+            percent = max(0, min(100, int(current * 100 / total)))
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(percent)
+        self.status_label.setText(text)
+
+    def on_search_finished(self, mode: str, result: Dict):
+        """Handle background search completion."""
+        finished_thread = self.sender()
+        if finished_thread is not None and finished_thread is not self.search_thread:
+            finished_thread.deleteLater()
+            return
+
+        self.search_thread = None
+        self.progress_bar.setVisible(False)
+        if finished_thread:
+            finished_thread.deleteLater()
+
+        if result.get("cancelled"):
+            self.status_label.setText("搜索已取消")
+            return
+
+        if mode == SearchThread.MODE_FIND_FIRST:
+            found_index = int(result.get("found_index", -1))
+            query = result.get("query", "")
+            hint = result.get("hint", "")
+            if found_index >= 0:
+                self.jump_to_instruction(found_index, add_history=True)
+                self.status_label.setText(f"已定位到第 {found_index + 1} 条指令")
+            else:
+                message = hint or f"未找到匹配项: {query}"
+                QMessageBox.information(self, "搜索结果", message)
+                self.status_label.setText(f"搜索无结果: {query}")
+            return
+
+        if mode == SearchThread.MODE_ADDRESS_ALL:
+            query = result.get("query", "")
+            matches = result.get("matches", [])
+            truncated = bool(result.get("truncated"))
+            if not matches:
+                QMessageBox.information(self, "地址全查", f"未找到匹配地址: {query}")
+                self.status_label.setText(f"地址全查无结果: {query}")
+            else:
+                suffix = "（结果已截断）" if truncated else ""
+                self.status_label.setText(f"地址全查完成: {len(matches)} 条匹配{suffix}")
+                self._show_address_matches_dialog(query, matches, truncated=truncated)
+            return
+
+        if mode == SearchThread.MODE_OFFSET_ALL:
+            query = result.get("query", "")
+            matches = result.get("matches", [])
+            truncated = bool(result.get("truncated"))
+            if not matches:
+                QMessageBox.information(self, "偏移搜索", f"未找到匹配偏移: {query}")
+                self.status_label.setText(f"偏移搜索无结果: {query}")
+            else:
+                suffix = "（结果已截断）" if truncated else ""
+                self.status_label.setText(f"偏移搜索完成: {len(matches)} 条匹配{suffix}")
+                self._show_offset_matches_dialog(query, matches, truncated=truncated)
+            return
+
+        if mode == SearchThread.MODE_MNEMONIC_ALL:
+            query = result.get("query", "")
+            lazy_result = bool(result.get("lazy"))
+            match_count = int(result.get("count", 0))
+            matches = (
+                MnemonicSearchResultsSource(self.parser, query)
+                if lazy_result and self.parser
+                else result.get("matches", [])
+            )
+            truncated = bool(result.get("truncated"))
+            if (lazy_result and match_count <= 0) or (not lazy_result and not matches):
+                QMessageBox.information(self, "指令全查", f"未找到匹配助记符: {query}")
+                self.status_label.setText(f"指令全查无结果: {query}")
+            else:
+                suffix = "（结果已截断）" if truncated else ""
+                total_matches = match_count if lazy_result else len(matches)
+                self.status_label.setText(f"指令全查完成: {total_matches} 条匹配{suffix}")
+                self._show_mnemonic_matches_dialog(query, matches, truncated=truncated)
+            return
+
+        if mode == SearchThread.MODE_DATA_ALL:
+            query = result.get("query", "")
+            matches = result.get("matches", [])
+            truncated = bool(result.get("truncated"))
+            if not matches:
+                QMessageBox.information(self, "数据全查", f"未找到匹配数据: {query}")
+                self.status_label.setText(f"数据全查无结果: {query}")
+            else:
+                suffix = "（结果已截断）" if truncated else ""
+                self.status_label.setText(f"数据全查完成: {len(matches)} 条匹配{suffix}")
+                self._show_data_matches_dialog(query, matches, truncated=truncated)
+            return
+
+    def on_search_error(self, error_msg: str):
+        """Show background search failures."""
+        errored_thread = self.sender()
+        if errored_thread is not None and errored_thread is not self.search_thread:
+            errored_thread.deleteLater()
+            return
+
+        if self.search_thread:
+            self.search_thread.deleteLater()
+        self.search_thread = None
+        self.progress_bar.setVisible(False)
+        QMessageBox.critical(self, "搜索失败", error_msg)
+        self.status_label.setText("搜索失败")
+
+    def _start_analysis_thread(self, mode: str, register: str):
+        """Run register analysis work without blocking the UI."""
+        if not self.parser or not self.cache_worker or self.selected_index < 0:
+            return
+
+        self._stop_analysis_thread()
+
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+
+        status_map = {
+            AnalysisThread.MODE_TRACE_SOURCE: f"正在追踪寄存器来源: {register}",
+            AnalysisThread.MODE_REVERSE_TAINT: f"正在执行反向污点分析: {register}",
+            AnalysisThread.MODE_DATA_PROVENANCE: f"正在追踪数据来源: {register}",
+        }
+        self.status_label.setText(status_map.get(mode, "正在分析..."))
+
+        self.analysis_thread = AnalysisThread(
+            self.parser,
+            self.cache_worker,
+            mode,
+            register,
+            self.selected_index,
+        )
+        self.analysis_thread.finished.connect(self.on_analysis_finished)
+        self.analysis_thread.error.connect(self.on_analysis_error)
+        self.analysis_thread.start()
+
+    def on_analysis_finished(self, mode: str, result: Dict):
+        """Handle background analysis completion."""
+        finished_thread = self.sender()
+        if finished_thread is not None and finished_thread is not self.analysis_thread:
+            finished_thread.deleteLater()
+            return
+
+        self.analysis_thread = None
+        self.progress_bar.setVisible(False)
+        if finished_thread:
+            finished_thread.deleteLater()
+
+        register = result.get("register", "")
+        if mode == AnalysisThread.MODE_TRACE_SOURCE:
+            source_index = result.get("source_index")
+            if isinstance(source_index, int) and source_index >= 0:
+                self.jump_to_instruction(source_index, add_history=True)
+                QTimer.singleShot(100, lambda: self.select_register_in_table(register))
+                source_instr = self.parser.parse_instruction_at(source_index)
+                if source_instr:
+                    self.status_label.setText(
+                        f"追踪: {register} 在第 {source_index + 1} 条指令被修改 ({source_instr.address})（PgUp 继续 / PgDn 返回）"
+                    )
+                else:
+                    self.status_label.setText(f"追踪完成: {register} -> 第 {source_index + 1} 条指令")
+            else:
+                self.status_label.setText(f"未找到寄存器 {register} 的来源")
+            return
+
+        if mode == AnalysisThread.MODE_REVERSE_TAINT:
+            chain = result.get("chain", [])
+            if not chain:
+                self.status_label.setText(f"反向污点分析无结果: {register}")
+                return
+            self.status_label.setText(
+                f"反向污点分析完成: {register}，共 {len(chain)} 条指令"
+            )
+            self._show_reverse_taint_dialog(register, chain)
+            return
+
+        if mode == AnalysisThread.MODE_DATA_PROVENANCE:
+            trace_result = result.get("trace_result", {})
+            events = trace_result.get("events", [])
+            message = trace_result.get("message", "")
+            if not events:
+                self.status_label.setText(f"数据来源追踪无结果: {register} ({message})")
+                return
+            self.status_label.setText(f"数据来源追踪完成: {register}，共 {len(events)} 条记录")
+            self._show_data_provenance_dialog(register, trace_result)
+
+    def on_analysis_error(self, error_msg: str):
+        """Show background analysis failures."""
+        errored_thread = self.sender()
+        if errored_thread is not None and errored_thread is not self.analysis_thread:
+            errored_thread.deleteLater()
+            return
+
+        if self.analysis_thread:
+            self.analysis_thread.deleteLater()
+        self.analysis_thread = None
+        self.progress_bar.setVisible(False)
+        QMessageBox.critical(self, "分析失败", error_msg)
+        self.status_label.setText("分析失败")
 
     def on_checkpoint_ready(self, index: int, state: RegisterState):
         """on_checkpoint_ready function."""
@@ -315,37 +1721,15 @@ class MainWindow(QMainWindow):
         if index < 0 or not self.register_calc:
             self.register_table.setRowCount(0)
             return
-        
-        instruction = self.parser.parse_instruction_at(index)
-        if not instruction:
-            return
-        
-        changed_registers = set()
-        for change in instruction.register_changes:
-            normalized = Register.normalize_name(change.register)
-            changed_registers.add(normalized)
-            if Register.is_w_register(change.register):
-                changed_registers.add('W_' + normalized)
-            else:
-                changed_registers.add('X_' + normalized)
-        
-        all_registers = RegisterCalculator.get_all_arm64_registers()
-        
-        
-        current_state = self.register_calc.compute_state_at(index, all_registers)
-        prev_state = RegisterState()
-        if index > 0:
-            prev_state = self.register_calc.compute_state_at(index - 1, all_registers)
-        
-        
-        sorted_registers = sorted(all_registers, key=RegisterCalculator.get_register_sort_key)
+
+        current_state, prev_state, changed_registers = self.register_calc.compute_state_for_display(index)
         
         
         self.register_table.setUpdatesEnabled(False)
         try:
-            self.register_table.setRowCount(len(sorted_registers))
+            self.register_table.setRowCount(len(self.sorted_registers))
             
-            for row, register in enumerate(sorted_registers):
+            for row, register in enumerate(self.sorted_registers):
                 is_x_series = Register.is_x_register(register)
                 
                 current_reg = current_state.get_register(register)
@@ -539,20 +1923,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("请先选择一条指令")
             return
 
-        source_index = self.register_calc.trace_register_source(register, self.selected_index)
-
-        if source_index is not None:
-            self.jump_to_instruction(source_index, add_history=True)
-
-            QTimer.singleShot(100, lambda: self.select_register_in_table(register))
-
-            source_instr = self.parser.parse_instruction_at(source_index)
-            if source_instr:
-                self.status_label.setText(
-                    f"追踪: {register} 在第 {source_index + 1} 条指令被修改 ({source_instr.address})（PgUp 继续 / PgDn 返回）"
-                )
-        else:
-            self.status_label.setText(f"未找到寄存器 {register} 的来源")
+        self._start_analysis_thread(AnalysisThread.MODE_TRACE_SOURCE, register)
 
     def _current_selected_register(self) -> Optional[str]:
         """_current_selected_register function."""
@@ -570,12 +1941,13 @@ class MainWindow(QMainWindow):
     def _show_reverse_taint_dialog(self, register: str, chain: List[dict]):
         """_show_reverse_taint_dialog function."""
         dialog = QDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.setWindowTitle(f"反向污点分析: {register}")
         dialog.resize(1380, 760)
         layout = QVBoxLayout(dialog)
 
         summary = QLabel(
-            f"目标寄存器: {register}，共回溯到 {len(chain)} 条指令，双击行可跳转。"
+            f"目标寄存器: {register}，共回溯到 {len(chain)} 条指令，双击行可跳转，窗口会保持打开。"
         )
         summary.setStyleSheet("color: #cccccc; padding: 4px 2px;")
         layout.addWidget(summary)
@@ -635,11 +2007,10 @@ class MainWindow(QMainWindow):
             if isinstance(index, int):
                 self.jump_to_instruction(index, add_history=True)
                 self.status_label.setText(f"反向污点跳转: 第 {index + 1} 条指令")
-                dialog.accept()
 
         table.cellDoubleClicked.connect(on_row_activated)
         layout.addWidget(table)
-        dialog.exec()
+        self._show_persistent_dialog(dialog, table)
 
     def analyze_reverse_taint(self, register: Optional[str] = None):
         """analyze_reverse_taint function."""
@@ -652,19 +2023,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("请先在寄存器表格中选中目标寄存器")
             return
 
-        chain = self.register_calc.reverse_taint_trace(
-            target_register,
-            self.selected_index,
-            max_steps=500,
-        )
-        if not chain:
-            self.status_label.setText(f"反向污点分析无结果: {target_register}")
-            return
-
-        self.status_label.setText(
-            f"反向污点分析完成: {target_register}，共 {len(chain)} 条指令"
-        )
-        self._show_reverse_taint_dialog(target_register, chain)
+        self._start_analysis_thread(AnalysisThread.MODE_REVERSE_TAINT, target_register)
 
     @staticmethod
     def _data_event_kind_text(kind: str) -> str:
@@ -680,12 +2039,13 @@ class MainWindow(QMainWindow):
         events = trace_result.get("events", [])
 
         dialog = QDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.setWindowTitle(f"数据来源追踪: {register}")
         dialog.resize(1480, 780)
         layout = QVBoxLayout(dialog)
 
         summary = QLabel(
-            f"目标寄存器: {register}，共 {len(events)} 条记录（读取 -> 写入 -> 计算链）。双击可跳转。"
+            f"目标寄存器: {register}，共 {len(events)} 条记录（读取 -> 写入 -> 计算链）。双击可跳转，窗口会保持打开。"
         )
         summary.setStyleSheet("color: #cccccc; padding: 4px 2px;")
         layout.addWidget(summary)
@@ -746,11 +2106,10 @@ class MainWindow(QMainWindow):
             if isinstance(index, int) and index >= 0:
                 self.jump_to_instruction(index, add_history=True)
                 self.status_label.setText(f"数据来源追踪跳转: 第 {index + 1} 条指令")
-                dialog.accept()
 
         table.cellDoubleClicked.connect(on_row_activated)
         layout.addWidget(table)
-        dialog.exec()
+        self._show_persistent_dialog(dialog, table)
 
     def analyze_data_provenance(self, register: Optional[str] = None):
         """analyze_data_provenance function."""
@@ -763,21 +2122,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("请先在寄存器表格中选中目标寄存器")
             return
 
-        trace_result = self.register_calc.trace_data_provenance(
-            target_register,
-            self.selected_index,
-            max_scan=30000,
-            max_calc_steps=160,
-        )
-        events = trace_result.get("events", [])
-        message = trace_result.get("message", "")
-
-        if not events:
-            self.status_label.setText(f"数据来源追踪无结果: {target_register} ({message})")
-            return
-
-        self.status_label.setText(f"数据来源追踪完成: {target_register}，共 {len(events)} 条记录")
-        self._show_data_provenance_dialog(target_register, trace_result)
+        self._start_analysis_thread(AnalysisThread.MODE_DATA_PROVENANCE, target_register)
 
     def select_register_in_table(self, register: str):
         """select_register_in_table function."""
@@ -919,34 +2264,38 @@ class MainWindow(QMainWindow):
         )
 
     @staticmethod
-    def _selected_row_indices(table: QTableWidget) -> List[int]:
-        selected = sorted({item.row() for item in table.selectedIndexes()})
+    def _selected_row_indices(table: QAbstractItemView) -> List[int]:
+        selection_model = table.selectionModel()
+        if selection_model is None:
+            return []
+        selected = sorted({index.row() for index in selection_model.selectedRows()})
         return selected
 
-    def _copy_table_rows(self, table: QTableWidget, rows: Optional[List[int]] = None):
-        if table.rowCount() == 0:
+    def _copy_table_rows(self, table: QAbstractItemView, rows: Optional[List[int]] = None):
+        model = table.model()
+        if model is None or model.rowCount() == 0:
             return
 
         row_indices = rows if rows is not None else self._selected_row_indices(table)
         if not row_indices:
-            row_indices = list(range(table.rowCount()))
+            row_indices = list(range(model.rowCount()))
 
         headers = []
-        for c in range(table.columnCount()):
-            header_item = table.horizontalHeaderItem(c)
-            headers.append(header_item.text() if header_item else f"col{c}")
+        for c in range(model.columnCount()):
+            header_text = model.headerData(c, Qt.Horizontal, Qt.DisplayRole)
+            headers.append(str(header_text) if header_text is not None else f"col{c}")
 
         lines = ["\t".join(headers)]
         for r in row_indices:
             cells = []
-            for c in range(table.columnCount()):
-                item = table.item(r, c)
-                cells.append(item.text() if item else "")
+            for c in range(model.columnCount()):
+                value = model.data(model.index(r, c), Qt.DisplayRole)
+                cells.append("" if value is None else str(value))
             lines.append("\t".join(cells))
 
         QApplication.clipboard().setText("\n".join(lines))
 
-    def _bind_table_copy_actions(self, table: QTableWidget):
+    def _bind_table_copy_actions(self, table: QAbstractItemView):
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -965,80 +2314,181 @@ class MainWindow(QMainWindow):
             if chosen == act_copy_selected:
                 self._copy_table_rows(table)
             elif chosen == act_copy_all:
-                self._copy_table_rows(table, list(range(table.rowCount())))
+                model = table.model()
+                if model is not None:
+                    self._copy_table_rows(table, list(range(model.rowCount())))
             elif chosen == act_select_all:
                 table.selectAll()
 
         table.customContextMenuRequested.connect(on_context_menu)
 
-    def _show_address_matches_dialog(self, search_text: str, matches: list):
+    def _make_result_column(
+        self,
+        header: str,
+        key: str,
+        sort_type: str = "text",
+    ) -> Dict[str, Any]:
+        def display(row: Dict[str, Any], data_key=key):
+            return row.get(data_key, "")
+
+        def sort_value(row: Dict[str, Any], data_key=key, data_sort=sort_type):
+            value = row.get(data_key, "")
+            if data_sort == "int":
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return -1
+            if data_sort == "address":
+                return self._address_sort_key(str(value))
+            return str(value or "").lower()
+
+        return {
+            "header": header,
+            "display": display,
+            "sort": sort_value,
+        }
+
+    def _create_search_results_view(
+        self,
+        dialog: QDialog,
+        columns: List[Dict[str, Any]],
+        rows: List[Dict[str, Any]],
+        jump_status_text: str,
+    ) -> QTableView:
+        table = QTableView(dialog)
+        model = SearchResultsTableModel(columns, rows, table)
+        proxy = QSortFilterProxyModel(table)
+        proxy.setSourceModel(model)
+        proxy.setSortRole(Qt.UserRole)
+        proxy.setDynamicSortFilter(False)
+        table.setModel(proxy)
+        self._bind_table_copy_actions(table)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.setSortingEnabled(True)
+
+        header = table.horizontalHeader()
+        for column_index in range(len(columns)):
+            stretch = column_index == len(columns) - 1
+            header.setSectionResizeMode(
+                column_index,
+                QHeaderView.Stretch if stretch else QHeaderView.ResizeToContents,
+            )
+
+        def on_row_activated(proxy_index: QModelIndex):
+            if not proxy_index.isValid():
+                return
+            source_index = proxy.mapToSource(proxy_index)
+            instruction_index = model.instruction_index_at(source_index.row())
+            if instruction_index >= 0:
+                self.jump_to_instruction(instruction_index, add_history=True)
+                self.status_label.setText(jump_status_text.format(index=instruction_index + 1))
+
+        table.doubleClicked.connect(on_row_activated)
+        return table
+
+    @staticmethod
+    def _result_rows_count(rows) -> int:
+        if isinstance(rows, list):
+            return len(rows)
+        if hasattr(rows, "row_count"):
+            return int(rows.row_count())
+        return 0
+
+    def _show_address_matches_dialog(self, search_text: str, matches: list, truncated: bool = False):
         dialog = QDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.setWindowTitle(f"地址全查: {search_text}")
         dialog.resize(1150, 680)
         layout = QVBoxLayout(dialog)
 
-        summary = QLabel(
-            f"共找到 {len(matches)} 条匹配，双击任意行可跳转到对应指令。"
-        )
+        summary_text = f"共找到 {len(matches)} 条匹配，结果完整保留，双击任意行可跳转到对应指令，窗口会保持打开。"
+        if truncated:
+            summary_text += " 当前结果曾被后台截断。"
+        summary = QLabel(summary_text)
         summary.setStyleSheet("color: #cccccc; padding: 4px 2px;")
         layout.addWidget(summary)
 
-        table = QTableWidget(dialog)
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["行号", "指令地址", "类型", "内存地址", "数据"])
-        table.setRowCount(len(matches))
-        self._bind_table_copy_actions(table)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        table.verticalHeader().setVisible(False)
-
-        header = table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.Stretch)
-
-        table.setSortingEnabled(False)
-        for row, match in enumerate(matches):
-            line_item = SortableTableWidgetItem(str(match["line"]), int(match["line"]))
-            line_item.setData(Qt.UserRole, int(match["index"]))
-            table.setItem(row, 0, line_item)
-            table.setItem(
-                row,
-                1,
-                SortableTableWidgetItem(
-                    match["instruction_address"],
-                    self._address_sort_key(match["instruction_address"]),
-                ),
-            )
-            table.setItem(row, 2, QTableWidgetItem(match["access"]))
-            table.setItem(
-                row,
-                3,
-                SortableTableWidgetItem(
-                    match["memory_address"],
-                    self._address_sort_key(match["memory_address"]),
-                ),
-            )
-            table.setItem(row, 4, QTableWidgetItem(match["data"]))
-        table.setSortingEnabled(True)
-        table.sortItems(3, Qt.AscendingOrder)
-
-        def on_row_activated(row: int, _column: int):
-            item = table.item(row, 0)
-            if not item:
-                return
-            index = item.data(Qt.UserRole)
-            if isinstance(index, int):
-                self.jump_to_instruction(index, add_history=True)
-                self.status_label.setText(
-                    f"地址全查跳转: 第 {index + 1} 条指令"
-                )
-                dialog.accept()
-
-        table.cellDoubleClicked.connect(on_row_activated)
+        columns = [
+            self._make_result_column("行号", "line", "int"),
+            self._make_result_column("指令地址", "instruction_address", "address"),
+            self._make_result_column("类型", "access"),
+            self._make_result_column("内存地址", "memory_address", "address"),
+            self._make_result_column("数据", "data"),
+        ]
+        table = self._create_search_results_view(
+            dialog,
+            columns,
+            matches,
+            "地址全查跳转: 第 {index} 条指令",
+        )
         layout.addWidget(table)
-        dialog.exec()
+        self._show_persistent_dialog(dialog, table)
+
+    def _show_offset_matches_dialog(self, query: str, matches: List[dict], truncated: bool = False):
+        dialog = QDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.setWindowTitle(f"偏移搜索: {query}")
+        dialog.resize(1380, 740)
+        layout = QVBoxLayout(dialog)
+
+        summary_text = f"匹配模块偏移 {query}，共找到 {len(matches)} 条结果，结果完整保留，双击可跳转，窗口会保持打开。"
+        if truncated:
+            summary_text += " 当前结果曾被后台截断。"
+        summary = QLabel(summary_text)
+        summary.setStyleSheet("color: #cccccc; padding: 4px 2px;")
+        layout.addWidget(summary)
+
+        columns = [
+            self._make_result_column("行号", "line", "int"),
+            self._make_result_column("指令地址", "instruction_address", "address"),
+            self._make_result_column("偏移", "offset", "address"),
+            self._make_result_column("助记符", "mnemonic"),
+            self._make_result_column("指令", "instruction_text"),
+            self._make_result_column("内存地址", "memory_address", "address"),
+            self._make_result_column("详情", "data"),
+        ]
+        table = self._create_search_results_view(
+            dialog,
+            columns,
+            matches,
+            "偏移搜索跳转: 第 {index} 条指令",
+        )
+        layout.addWidget(table)
+        self._show_persistent_dialog(dialog, table)
+
+    def _show_data_matches_dialog(self, query: str, matches: List[dict], truncated: bool = False):
+        dialog = QDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.setWindowTitle(f"数据全查: {query}")
+        dialog.resize(1500, 760)
+        layout = QVBoxLayout(dialog)
+
+        summary_text = f"匹配数据 {query}，共找到 {len(matches)} 条结果，结果完整保留，双击可跳转，窗口会保持打开。"
+        if truncated:
+            summary_text += " 当前结果曾被后台截断。"
+        summary = QLabel(summary_text)
+        summary.setStyleSheet("color: #cccccc; padding: 4px 2px;")
+        layout.addWidget(summary)
+
+        columns = [
+            self._make_result_column("行号", "line", "int"),
+            self._make_result_column("指令地址", "instruction_address", "address"),
+            self._make_result_column("偏移", "offset", "address"),
+            self._make_result_column("助记符", "mnemonic"),
+            self._make_result_column("指令", "instruction_text"),
+            self._make_result_column("命中位置", "match_scope"),
+            self._make_result_column("内存地址", "memory_address", "address"),
+            self._make_result_column("详情", "data"),
+        ]
+        table = self._create_search_results_view(
+            dialog,
+            columns,
+            matches,
+            "数据全查跳转: 第 {index} 条指令",
+        )
+        layout.addWidget(table)
+        self._show_persistent_dialog(dialog, table)
 
     def search_all_addresses(self):
         search_text = self.search_input.text().strip()
@@ -1054,16 +2504,24 @@ class MainWindow(QMainWindow):
             return
 
         self.status_label.setText(f"正在全量搜索地址: {search_text} ...")
-        QApplication.processEvents()
+        self._start_search_thread(SearchThread.MODE_ADDRESS_ALL, search_text)
 
-        matches = self._collect_address_matches(search_text)
-        if not matches:
-            QMessageBox.information(self, "地址全查", f"未找到匹配地址: {search_text}")
-            self.status_label.setText(f"地址全查无结果: {search_text}")
+    def search_data_values(self):
+        search_text = self.search_input.text().strip()
+        if not search_text or not self.parser:
             return
 
-        self.status_label.setText(f"地址全查完成: {len(matches)} 条匹配")
-        self._show_address_matches_dialog(search_text, matches)
+        query = SearchThread._normalize_data_query(search_text)
+        if not query:
+            QMessageBox.information(
+                self,
+                "数据全查",
+                "请输入要搜索的数据，例如 0x746d2a63。",
+            )
+            return
+
+        self.status_label.setText(f"正在全量搜索数据: {query} ...")
+        self._start_search_thread(SearchThread.MODE_DATA_ALL, query)
 
     @staticmethod
     def _normalize_mnemonic_query(search_text: str) -> str:
@@ -1078,9 +2536,14 @@ class MainWindow(QMainWindow):
             query = query[:-1]
         return bool(query) and bool(re.fullmatch(r"[a-z][a-z0-9.]*", query))
 
-    def _build_instruction_memory_summary(self, instruction: Optional[Instruction]) -> Tuple[str, str]:
+    def _build_instruction_memory_summary(
+        self,
+        instruction: Optional[Instruction],
+        fallback_text: str = "",
+    ) -> Tuple[str, str]:
         if not instruction:
-            return "-", "-"
+            detail_text = (fallback_text or "").strip()
+            return "-", detail_text if detail_text else "-"
 
         if instruction.memory_ops:
             addresses: List[str] = []
@@ -1105,7 +2568,8 @@ class MainWindow(QMainWindow):
                 dump_hex += " ..."
             return ", ".join(addresses), dump_hex if dump_hex else "-"
 
-        return "-", "-"
+        detail_text = (fallback_text or "").strip()
+        return "-", detail_text if detail_text else "-"
 
     def _collect_mnemonic_matches(self, mnemonic_query: str) -> List[dict]:
         query = self._normalize_mnemonic_query(mnemonic_query)
@@ -1132,14 +2596,21 @@ class MainWindow(QMainWindow):
             elif mnemonic != query:
                 continue
 
+            full_info = self.parser.get_instruction_info(i, include_line_text=True)
+            if not full_info:
+                continue
+
             instruction = self.parser.parse_instruction_at(i)
-            mem_addr, mem_data = self._build_instruction_memory_summary(instruction)
+            mem_addr, mem_data = self._build_instruction_memory_summary(
+                instruction,
+                full_info.comment,
+            )
             matches.append({
                 "index": i,
                 "line": i + 1,
-                "instruction_address": self._format_address_for_display(info.address),
-                "mnemonic": info.mnemonic,
-                "instruction_text": f"{info.mnemonic} {info.operands}".strip(),
+                "instruction_address": self._format_address_for_display(full_info.address),
+                "mnemonic": full_info.mnemonic,
+                "instruction_text": f"{full_info.mnemonic} {full_info.operands}".strip(),
                 "memory_address": mem_addr,
                 "data": mem_data,
             })
@@ -1152,65 +2623,37 @@ class MainWindow(QMainWindow):
             ),
         )
 
-    def _show_mnemonic_matches_dialog(self, query: str, matches: List[dict]):
+    def _show_mnemonic_matches_dialog(self, query: str, matches: List[dict], truncated: bool = False):
         dialog = QDialog(self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.setWindowTitle(f"指令全查: {query}")
         dialog.resize(1320, 720)
         layout = QVBoxLayout(dialog)
 
-        summary = QLabel(f"匹配助记符 `{query}`，共找到 {len(matches)} 条结果，双击可跳转。")
+        total_matches = self._result_rows_count(matches)
+        summary_text = f"匹配助记符 `{query}`，共找到 {total_matches} 条结果，结果完整保留，双击可跳转，窗口会保持打开。"
+        if truncated:
+            summary_text += " 当前结果曾被后台截断。"
+        summary = QLabel(summary_text)
         summary.setStyleSheet("color: #cccccc; padding: 4px 2px;")
         layout.addWidget(summary)
 
-        table = QTableWidget(dialog)
-        table.setColumnCount(6)
-        table.setHorizontalHeaderLabels(["行号", "指令地址", "助记符", "指令", "内存地址", "数据"])
-        table.setRowCount(len(matches))
-        self._bind_table_copy_actions(table)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        table.verticalHeader().setVisible(False)
-
-        header = table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.Stretch)
-
-        table.setSortingEnabled(False)
-        for row, match in enumerate(matches):
-            line_item = SortableTableWidgetItem(str(match["line"]), int(match["line"]))
-            line_item.setData(Qt.UserRole, int(match["index"]))
-            table.setItem(row, 0, line_item)
-            table.setItem(
-                row,
-                1,
-                SortableTableWidgetItem(
-                    match["instruction_address"],
-                    self._address_sort_key(match["instruction_address"]),
-                ),
-            )
-            table.setItem(row, 2, QTableWidgetItem(match["mnemonic"]))
-            table.setItem(row, 3, QTableWidgetItem(match["instruction_text"]))
-            table.setItem(row, 4, QTableWidgetItem(match["memory_address"]))
-            table.setItem(row, 5, QTableWidgetItem(match["data"]))
-        table.setSortingEnabled(True)
-        table.sortItems(1, Qt.AscendingOrder)
-
-        def on_row_activated(row: int, _column: int):
-            item = table.item(row, 0)
-            if not item:
-                return
-            index = item.data(Qt.UserRole)
-            if isinstance(index, int):
-                self.jump_to_instruction(index, add_history=True)
-                self.status_label.setText(f"指令全查跳转: 第 {index + 1} 条指令")
-                dialog.accept()
-
-        table.cellDoubleClicked.connect(on_row_activated)
+        columns = [
+            self._make_result_column("行号", "line", "int"),
+            self._make_result_column("指令地址", "instruction_address", "address"),
+            self._make_result_column("助记符", "mnemonic"),
+            self._make_result_column("指令", "instruction_text"),
+            self._make_result_column("内存地址", "memory_address", "address"),
+            self._make_result_column("详情", "data"),
+        ]
+        table = self._create_search_results_view(
+            dialog,
+            columns,
+            matches,
+            "指令全查跳转: 第 {index} 条指令",
+        )
         layout.addWidget(table)
-        dialog.exec()
+        self._show_persistent_dialog(dialog, table)
 
     def search_instructions_by_mnemonic(self):
         if not self.parser:
@@ -1226,16 +2669,7 @@ class MainWindow(QMainWindow):
             return
 
         self.status_label.setText(f"正在全量搜索指令: {query} ...")
-        QApplication.processEvents()
-
-        matches = self._collect_mnemonic_matches(query)
-        if not matches:
-            QMessageBox.information(self, "指令全查", f"未找到匹配助记符: {query}")
-            self.status_label.setText(f"指令全查无结果: {query}")
-            return
-
-        self.status_label.setText(f"指令全查完成: {len(matches)} 条匹配")
-        self._show_mnemonic_matches_dialog(query, matches)
+        self._start_search_thread(SearchThread.MODE_MNEMONIC_ALL, query)
 
     def search_instruction(self):
         """search_instruction function."""
@@ -1257,25 +2691,14 @@ class MainWindow(QMainWindow):
                 self.search_instructions_by_mnemonic()
                 return
 
-            search_lower = search_text.lower()
-            search_addr = self._normalize_address_text(search_text)
-            enable_memory_addr_search = self._is_probable_address_query(search_text)
+            if SearchThread._is_probable_offset_query(search_text):
+                self.status_label.setText(f"正在全量搜索偏移: {search_text} ...")
+                self._start_search_thread(SearchThread.MODE_OFFSET_ALL, search_text)
+                return
+
             start_index = self.selected_index + 1 if self.selected_index >= 0 else 0
-
-            for i in range(start_index, self.instruction_count):
-                if self._instruction_matches_search(
-                    i, search_lower, search_addr, enable_memory_addr_search
-                ):
-                    found_index = i
-                    break
-
-            if found_index == -1:
-                for i in range(0, start_index):
-                    if self._instruction_matches_search(
-                        i, search_lower, search_addr, enable_memory_addr_search
-                    ):
-                        found_index = i
-                        break
+            self._start_search_thread(SearchThread.MODE_FIND_FIRST, search_text, start_index)
+            return
 
         if found_index != -1:
             self.jump_to_instruction(found_index, add_history=True)
@@ -1288,6 +2711,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(lambda: self.search_input.setFocus())
         QShortcut(QKeySequence("F3"), self).activated.connect(self.search_instruction)
         QShortcut(QKeySequence("Ctrl+Shift+F"), self).activated.connect(self.search_all_addresses)
+        QShortcut(QKeySequence("Ctrl+Shift+D"), self).activated.connect(self.search_data_values)
         QShortcut(QKeySequence("Ctrl+Shift+M"), self).activated.connect(self.search_instructions_by_mnemonic)
         QShortcut(QKeySequence("Ctrl+T"), self).activated.connect(self.quick_data_provenance)
         QShortcut(QKeySequence("Ctrl+Shift+T"), self).activated.connect(self.quick_reverse_taint)
@@ -1396,8 +2820,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """closeEvent function."""
+        self._stop_search_thread()
+        self._stop_analysis_thread()
         if self.cache_worker:
             self.cache_worker.stop()
+        if self.parser:
+            self.parser.close()
         if self.virtual_table:
             self.virtual_table.clear()
         event.accept()
@@ -1414,11 +2842,5 @@ def main():
 
 
 if __name__ == '__main__':
-    #python -m venv venv
+    #.\venv\Scripts\Activate.ps1
     main()
-
-
-
-
-
-

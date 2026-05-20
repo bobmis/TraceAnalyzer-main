@@ -3,6 +3,8 @@
 
 class Register:
     """Register class."""
+
+    __slots__ = ("name", "_value")
     
     def __init__(self, name: str, value: int = 0):
         """__init__ function."""
@@ -83,6 +85,8 @@ class Register:
 
 class RegisterState:
     """RegisterState class."""
+
+    __slots__ = ("registers",)
     
     def __init__(self):
         self.registers: dict[str, Register] = {}

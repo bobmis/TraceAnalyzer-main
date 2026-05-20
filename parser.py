@@ -7,6 +7,8 @@ import re
 class RegisterChange:
     """RegisterChange class."""
 
+    __slots__ = ("register", "old_value", "new_value")
+
     def __init__(self, register: str, old_value: str, new_value: str):
         self.register = register
         self.old_value = old_value
@@ -15,6 +17,8 @@ class RegisterChange:
 
 class MemoryOperation:
     """MemoryOperation class."""
+
+    __slots__ = ("type", "address", "instruction_address", "data_size", "data_value")
 
     def __init__(self, op_type: str, address: str, instruction_address: str, data_size: int, data_value: str):
         self.type = op_type
@@ -27,6 +31,8 @@ class MemoryOperation:
 class MemoryDumpLine:
     """MemoryDumpLine class."""
 
+    __slots__ = ("address", "data", "is_modified")
+
     def __init__(self, address: str, data: List[str], is_modified: bool):
         self.address = address
         self.data = data
@@ -35,6 +41,18 @@ class MemoryDumpLine:
 
 class Instruction:
     """Instruction class."""
+
+    __slots__ = (
+        "address",
+        "offset",
+        "mnemonic",
+        "operands",
+        "register_changes",
+        "memory_ops",
+        "memory_dump",
+        "line_number",
+        "raw_line",
+    )
 
     def __init__(
         self,

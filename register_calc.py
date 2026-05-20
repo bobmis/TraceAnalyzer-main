@@ -2,6 +2,7 @@
 import bisect
 import time
 import re
+from collections import OrderedDict
 from typing import Dict, Optional, Set, List, Tuple, TYPE_CHECKING
 
 from register import Register, RegisterState
@@ -20,11 +21,44 @@ class RegisterCalculator:
         
         self._local_cache: Dict[int, RegisterState] = {}
         self._local_cache_max_size = 50
+        self._write_set_cache: "OrderedDict[int, Set[str]]" = OrderedDict()
+        self._write_set_cache_max_size = 4096
     
     def set_parser(self, parser: 'LazyLogParser'):
         """set_parser function."""
         self.parser = parser
         self._local_cache.clear()
+        self._write_set_cache.clear()
+
+    def _best_local_cache_index(self, index: int) -> int:
+        best = -1
+        for cached_index in self._local_cache.keys():
+            if cached_index <= index and cached_index > best:
+                best = cached_index
+        return best
+
+    def _get_instruction_write_set(self, index: int, instruction=None) -> Set[str]:
+        cached = self._write_set_cache.get(index)
+        if cached is not None:
+            self._write_set_cache.move_to_end(index)
+            return set(cached)
+
+        if instruction is None and self.parser:
+            instruction = self.parser.parse_instruction_at(index)
+        if not instruction:
+            return set()
+
+        writes = {
+            normalized
+            for change in instruction.register_changes
+            for normalized in [self._normalize_taint_register(change.register)]
+            if normalized
+        }
+        self._write_set_cache[index] = set(writes)
+        self._write_set_cache.move_to_end(index)
+        while len(self._write_set_cache) > self._write_set_cache_max_size:
+            self._write_set_cache.popitem(last=False)
+        return writes
     
     def compute_state_at(self, index: int, registers_to_show: Optional[Set[str]] = None) -> RegisterState:
         """compute_state_at function."""
@@ -35,20 +69,23 @@ class RegisterCalculator:
         
         if index in self._local_cache:
             return self._local_cache[index].copy()
-        
+
+        base_index = -1
+        state = RegisterState()
+
+        local_cache_index = self._best_local_cache_index(index)
+        if local_cache_index >= 0:
+            state = self._local_cache[local_cache_index].copy()
+            base_index = local_cache_index
+
         checkpoint_index = self.cache_worker.find_nearest_checkpoint(index)
-        
-        if checkpoint_index >= 0:
+        if checkpoint_index > base_index:
             checkpoint_state = self.cache_worker.get_checkpoint(checkpoint_index)
             if checkpoint_state:
                 state = checkpoint_state.copy()
-                start_index = checkpoint_index + 1
-            else:
-                state = RegisterState()
-                start_index = 0
-        else:
-            state = RegisterState()
-            start_index = 0
+                base_index = checkpoint_index
+
+        start_index = base_index + 1
         
         instructions_processed = 0
         for i in range(start_index, index + 1):
@@ -68,7 +105,7 @@ class RegisterCalculator:
         compute_time = (time.time() - compute_start) * 1000
         if compute_time > 50:
             print(
-                f"[RegisterCalc] compute index {index}, from checkpoint {checkpoint_index}, "
+                f"[RegisterCalc] compute index {index}, from base {base_index}, "
                 f"processed {instructions_processed} instructions, took {compute_time:.1f}ms"
             )
         
@@ -104,9 +141,13 @@ class RegisterCalculator:
         """trace_register_source function."""
         if from_index < 0 or not self.parser:
             return None
-        
+
+        if hasattr(self.parser, "find_previous_write_to_register"):
+            source_index = self.parser.find_previous_write_to_register(register, from_index - 1)
+            return source_index if source_index >= 0 else None
+
         related_registers = self.get_related_registers(register)
-        
+
         for i in range(from_index - 1, -1, -1):
             instruction = self.parser.parse_instruction_at(i)
             if instruction:
@@ -187,22 +228,37 @@ class RegisterCalculator:
         tainted: Set[str] = {target}
         chain: List[Dict] = []
 
-        for i in range(from_index, -1, -1):
+        cursor = from_index
+        while cursor >= 0 and tainted and len(chain) < max_steps:
+            if hasattr(self.parser, "find_previous_write_to_register"):
+                candidate_index = -1
+                for reg_name in tainted:
+                    hit_index = self.parser.find_previous_write_to_register(reg_name, cursor)
+                    if hit_index > candidate_index:
+                        candidate_index = hit_index
+                if candidate_index < 0:
+                    break
+                i = candidate_index
+            else:
+                i = -1
+                for scan_index in range(cursor, -1, -1):
+                    instruction = self.parser.parse_instruction_at(scan_index)
+                    writes = self._get_instruction_write_set(scan_index, instruction)
+                    if tainted & writes:
+                        i = scan_index
+                        break
+                if i < 0:
+                    break
+
             instruction = self.parser.parse_instruction_at(i)
             if not instruction:
+                cursor = i - 1
                 continue
 
-            writes = {
-                normalized
-                for change in instruction.register_changes
-                for normalized in [self._normalize_taint_register(change.register)]
-                if normalized
-            }
-            if not writes:
-                continue
-
+            writes = self._get_instruction_write_set(i, instruction)
             hit_writes = tainted & writes
             if not hit_writes:
+                cursor = i - 1
                 continue
 
             taint_before = set(tainted)
@@ -224,11 +280,7 @@ class RegisterCalculator:
                 'taint_before': sorted(taint_before),
                 'taint_after': sorted(tainted),
             })
-
-            if len(chain) >= max_steps:
-                break
-            if not tainted:
-                break
+            cursor = i - 1
 
         return chain
 
@@ -515,6 +567,17 @@ class RegisterCalculator:
         if not self.parser:
             return None
 
+        if hasattr(self.parser, "find_previous_memory_write"):
+            indexed_hit = self.parser.find_previous_memory_write(
+                start_index=start_index,
+                target_addr=target_addr,
+                target_size=target_size,
+                target_bytes=target_bytes,
+                max_records=max_scan,
+            )
+            if indexed_hit:
+                return indexed_hit
+
         scanned = 0
         for idx in range(start_index, -1, -1):
             scanned += 1
@@ -682,18 +745,29 @@ class RegisterCalculator:
     def clear_local_cache(self):
         """clear_local_cache function."""
         self._local_cache.clear()
+        self._write_set_cache.clear()
     
     @staticmethod
     def get_related_registers(register: str) -> List[str]:
         """get_related_registers function."""
-        registers = [register]
-        
-        if register.startswith('W') and register[1:].isdigit():
-            registers.append('X' + register[1:])
-        elif register.startswith('X') and register[1:].isdigit():
-            registers.append('W' + register[1:])
-        
-        return registers
+        reg = (register or "").strip().upper()
+        registers = [reg] if reg else []
+
+        if reg == 'FP':
+            registers.append('X29')
+        elif reg == 'X29':
+            registers.append('FP')
+        elif reg == 'LR':
+            registers.append('X30')
+        elif reg == 'X30':
+            registers.append('LR')
+
+        if reg.startswith('W') and reg[1:].isdigit():
+            registers.append('X' + reg[1:])
+        elif reg.startswith('X') and reg[1:].isdigit():
+            registers.append('W' + reg[1:])
+
+        return list(dict.fromkeys(registers))
     
     @staticmethod
     def get_all_arm64_registers() -> Set[str]:
