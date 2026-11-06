@@ -446,6 +446,20 @@ def infer_memory_operation_from_instruction(
 
 def parse_memory_operation(line: str) -> Optional[MemoryOperation]:
     """parse_memory_operation function."""
+    # ---- QTrace native format: mem[w]: 0xADDR size: N value: 0xVAL ----
+    qtrace_match = re.match(
+        r"mem\[([rw])\]:\s*(0x[0-9a-fA-F]+)\s+size:\s*(\d+)\s+value:\s*(0x[0-9a-fA-F]+)",
+        line.strip(),
+    )
+    if qtrace_match:
+        return MemoryOperation(
+            op_type="write" if qtrace_match.group(1) == "w" else "read",
+            address=qtrace_match.group(2),
+            instruction_address="",  # QTrace mem行不含指令地址, 归属前一条指令
+            data_size=int(qtrace_match.group(3)),
+            data_value=qtrace_match.group(4)[2:] if qtrace_match.group(4).startswith("0x") else qtrace_match.group(4),
+        )
+
     write_pattern = (
         r"memory write at (0x[0-9a-f]+), instruction address = (0x[0-9a-f]+), "
         r"data size = (\d+), data value = ([0-9a-f]+)"
@@ -508,6 +522,40 @@ def parse_instruction_fields(line: str) -> Optional[Dict[str, str]]:
     trimmed = line.strip()
     if not trimmed:
         return None
+
+    # ---- QTrace native format ----
+    # 指令行: "0x5a2fc: \tmnemonic\toperands[\t[REG=.. ][\t => [REG=.. ]]]" (冒号后空格+tab)
+    # 内存行: "mem[w]: 0xaddr size: N value: 0xVAL" (由 parse_memory_operation 处理)
+    _qt = re.match(r"^(0x[0-9a-fA-F]+):\s*\t(.*)$", trimmed, re.S)
+    if _qt:
+        address = _qt.group(1)
+        rest = _qt.group(2)
+        # 寄存器块起点: '\t['(before块) / '\t =>'(仅after块) / '\t;'
+        cut = len(rest)
+        for marker in ("\t[", "\t =>", "\t;"):
+            i = rest.find(marker)
+            if i != -1 and i < cut:
+                cut = i
+        body = rest[:cut].replace("\t", " ").strip()
+        regs = rest[cut:].strip()
+        semicolon_index = body.find(";")
+        if semicolon_index != -1:
+            comment = body[semicolon_index + 1 :].strip()
+            body = body[:semicolon_index].strip()
+        else:
+            comment = regs  # 寄存器信息放注释列, 寄存器变化由transition解析提取
+        instruction_parts = body.split(maxsplit=1)
+        mnemonic = instruction_parts[0] if instruction_parts else ""
+        operands = instruction_parts[1] if len(instruction_parts) > 1 else ""
+        if not mnemonic:
+            return None
+        return {
+            "address": address,
+            "offset": address,  # QTrace地址即模块内偏移
+            "mnemonic": mnemonic,
+            "operands": operands,
+            "comment": comment,
+        }
 
     if trimmed.startswith("0x"):
         parts = [p for p in re.split(r"\t+", trimmed) if p]

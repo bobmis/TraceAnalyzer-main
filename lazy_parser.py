@@ -344,7 +344,49 @@ class LazyLogParser:
                 continue
             seen.add(key)
             hints.append(key)
+
+        # ---- QTrace: hex值主动解码为ASCII字符串注解 ----
+        # 寄存器块 [X8=0x30332e36362e3031 ] / mem行 value: 0x...
+        for match in re.finditer(
+            r"\b([A-Za-z][A-Za-z0-9_.]*)\s*=\s*(0x[0-9a-fA-F]{8,16})\b", raw_line
+        ):
+            reg = match.group(1).upper()
+            value = match.group(2)
+            string_value = cls._hex_value_to_ascii_string(value)
+            if string_value is None:
+                continue
+            key = (reg, value, string_value, cls._string_to_hex_bytes(string_value))
+            if key not in seen:
+                seen.add(key)
+                hints.append(key)
+        # QTrace mem行: "mem[w]: 0xaddr size: 8 value: 0x..."
+        if raw_line.startswith("mem["):
+            mval = re.search(r"\bvalue:\s*(0x[0-9a-fA-F]{8,16})\b", raw_line)
+            if mval:
+                value = mval.group(1)
+                string_value = cls._hex_value_to_ascii_string(value)
+                if string_value is not None:
+                    key = ("MEM", value, string_value, cls._string_to_hex_bytes(string_value))
+                    if key not in seen:
+                        seen.add(key)
+                        hints.append(key)
         return hints
+
+    @staticmethod
+    def _hex_value_to_ascii_string(hex_str: str) -> Optional[str]:
+        """把QTrace的hex数值按小端字节解码为可打印ASCII串(≥4字符全可打印才返回)."""
+        try:
+            val = int(hex_str, 16)
+        except ValueError:
+            return None
+        n = len(hex_str) - 2
+        nbytes = (n + 1) // 2
+        if nbytes < 4 or nbytes > 8:
+            return None
+        data = val.to_bytes(8, "little")[:nbytes]
+        if all(0x20 <= b < 0x7F for b in data):
+            return data.decode("ascii")
+        return None
 
     def build_index(
         self,

@@ -315,16 +315,45 @@ class SearchThread(QThread):
             token = text
             if token.startswith("0x") or token.startswith("0X"):
                 token = token.lower()
-            return token, ""
+            string_preview = SearchThread._hex_token_to_string_preview(token)
+            if string_preview:
+                return token, f'{text}  (string: "{string_preview}")' if text != token else f'string: "{string_preview}"'
+            return token, text
 
         values = []
+        previews = []
         for match in assignments:
             token = match.group(2).strip()
             if token.startswith("0x") or token.startswith("0X"):
                 token = token.lower()
             values.append(token)
+            preview = SearchThread._hex_token_to_string_preview(token)
+            if preview:
+                previews.append(f'{match.group(1)}="{preview}"')
         value_text = values[0] if len(values) == 1 else ", ".join(values)
-        return value_text, text
+        detail = text
+        if previews:
+            detail = f'{text}  (string: {" ".join(previews)})'
+        return value_text, detail
+
+    @staticmethod
+    def _hex_token_to_string_preview(token: str) -> str:
+        """hex数值 → 小端ASCII字符串预览(≥4字符全可打印才返回, 否则空串)."""
+        m = re.fullmatch(r"0x[0-9a-fA-F]{8,16}", token or "")
+        if not m:
+            return ""
+        try:
+            val = int(token, 16)
+        except ValueError:
+            return ""
+        n = len(token) - 2
+        nbytes = (n + 1) // 2
+        if nbytes < 4 or nbytes > 8:
+            return ""
+        data = val.to_bytes(8, "little")[:nbytes]
+        if all(0x20 <= b < 0x7F for b in data):
+            return data.decode("ascii")
+        return ""
 
     @staticmethod
     def _is_memory_address_match(
@@ -2781,11 +2810,25 @@ class MainWindow(QMainWindow):
         text = raw_value.strip()
         assignments = list(re.finditer(r"\b([A-Za-z][\w.]*)\s*=\s*([^\s,]+)", text))
         if not assignments:
-            return self._normalize_data_token(text), ""
+            token = self._normalize_data_token(text)
+            preview = SearchThread._hex_token_to_string_preview(token)
+            if preview:
+                return token, f'string: "{preview}"'
+            return token, ""
 
-        values = [self._normalize_data_token(match.group(2)) for match in assignments]
+        values = []
+        previews = []
+        for match in assignments:
+            token = self._normalize_data_token(match.group(2))
+            values.append(token)
+            preview = SearchThread._hex_token_to_string_preview(token)
+            if preview:
+                previews.append(f'{match.group(1)}="{preview}"')
         value_text = values[0] if len(values) == 1 else ", ".join(values)
-        return value_text, text
+        detail = text
+        if previews:
+            detail = f'{text}  (string: {" ".join(previews)})'
+        return value_text, detail
 
     def update_memory_display(self, instruction: Instruction):
         """update_memory_display function."""
