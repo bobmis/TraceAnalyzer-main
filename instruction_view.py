@@ -1,4 +1,4 @@
-"""instruction_view module."""
+﻿"""instruction_view module."""
 import math
 from typing import Optional, Callable, List, Dict, TYPE_CHECKING
 
@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QScrollBar, QLabel, QFrame, QHeaderView, QAbstractItemView, QApplication
 )
-from PySide6.QtCore import Qt, QTimer, QObject, Signal, QThread
+from PySide6.QtCore import Qt, QTimer, QObject, Signal, QThread, QRect
 from PySide6.QtGui import QColor, QFont, QWheelEvent, QKeySequence, QShortcut
 
 if TYPE_CHECKING:
@@ -55,7 +55,7 @@ class DataCacheWorker(QThread):
         
         if self._running:
             self.finished.emit()
-            print(f"[缓存] 数据缓存完成")
+            print("[缓存] 数据缓存完成")
     
     def stop(self):
         self._running = False
@@ -80,6 +80,7 @@ class VirtualScrollTable(QWidget):
         self.parser: Optional['LazyLogParser'] = None
         self.total_rows = 0
         self.visible_rows = 50
+        self.page_rows = 50
         self.current_top = 0
         self.selected_logical_row = -1
         
@@ -108,7 +109,10 @@ class VirtualScrollTable(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setFont(QFont('Consolas', 10))
+        self.table.setWordWrap(True)
+        self.table.setTextElideMode(Qt.ElideNone)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(24)
         self.table.setAlternatingRowColors(True)
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -118,19 +122,12 @@ class VirtualScrollTable(QWidget):
         header.setSectionResizeMode(1, QHeaderView.Fixed)
         header.setSectionResizeMode(2, QHeaderView.Fixed)
         header.setSectionResizeMode(3, QHeaderView.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.Interactive)
         self.table.setColumnWidth(0, 70)
         self.table.setColumnWidth(1, 120)
         self.table.setColumnWidth(2, 80)
         self.table.setColumnWidth(3, 80)
-        
-        self.table.setStyleSheet("""
-            QTableWidget::item:selected {
-                background-color: rgb(37, 99, 235);
-                color: white;
-            }
-        """)
         
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
         self.table.cellClicked.connect(self._on_cell_clicked)
@@ -147,6 +144,18 @@ class VirtualScrollTable(QWidget):
         layout.addWidget(self.scrollbar)
         
         self._init_empty_table()
+        QTimer.singleShot(0, self.refresh_geometry)
+
+    def _ensure_table_rows(self, row_count: int):
+        """确保表格真实拥有指定数量的可复用行和单元格。"""
+        row_count = max(0, row_count)
+        if self.table.rowCount() != row_count:
+            self.table.setRowCount(row_count)
+
+        for row in range(row_count):
+            for col in range(self.table.columnCount()):
+                if self.table.item(row, col) is None:
+                    self.table.setItem(row, col, QTableWidgetItem(''))
     
     def _calculate_visible_rows(self):
         """_calculate_visible_rows function."""
@@ -172,29 +181,21 @@ class VirtualScrollTable(QWidget):
             row_height = 24
         
         calculated_rows = (available_height + row_height * 0.8) / row_height
-        new_visible_rows = max(1, int(math.ceil(calculated_rows)))
+        new_page_rows = max(1, int(math.ceil(calculated_rows)))
+        new_visible_rows = max(new_page_rows + 8, int(math.ceil(new_page_rows * 1.5)))
         
         
-        if new_visible_rows != self.visible_rows:
+        if new_visible_rows != self.visible_rows or new_page_rows != self.page_rows:
             old_selected = self.selected_logical_row
-            old_top = self.current_top
             
+            self.page_rows = new_page_rows
             self.visible_rows = new_visible_rows
-            
-            current_row_count = self.table.rowCount()
-            if current_row_count != self.visible_rows:
-                if self.visible_rows > current_row_count:
-                    for row in range(current_row_count, self.visible_rows):
-                        for col in range(6):
-                            item = QTableWidgetItem('')
-                            self.table.setItem(row, col, item)
-                else:
-                    self.table.setRowCount(self.visible_rows)
+            self._ensure_table_rows(self.visible_rows)
             
             if self.total_rows > 0:
-                max_scroll = max(0, self.total_rows - self.visible_rows)
+                max_scroll = max(0, self.total_rows - self.page_rows)
                 self.scrollbar.setMaximum(max_scroll)
-                self.scrollbar.setPageStep(self.visible_rows)
+                self.scrollbar.setPageStep(self.page_rows)
                 
                 if self.current_top > max_scroll:
                     self.current_top = max_scroll
@@ -204,19 +205,78 @@ class VirtualScrollTable(QWidget):
                 
                 if old_selected >= 0:
                     self.select_logical_row(old_selected)
-    
+
+    def _adjust_column_widths(self):
+        """根据当前可见宽度重新分配操作数与注释列宽。"""
+        if not self.table:
+            return
+
+        viewport_width = self.table.viewport().width()
+        if viewport_width <= 0:
+            return
+
+        fixed_width = (
+            self.table.columnWidth(0)
+            + self.table.columnWidth(1)
+            + self.table.columnWidth(2)
+            + self.table.columnWidth(3)
+        )
+        remaining_width = max(220, viewport_width - fixed_width - 8)
+
+        if remaining_width <= 360:
+            operands_width = max(100, remaining_width // 3)
+            comment_width = max(120, remaining_width - operands_width)
+        else:
+            operands_width = max(140, int(remaining_width * 0.34))
+            comment_width = max(180, remaining_width - operands_width)
+
+        self.table.setColumnWidth(4, operands_width)
+        self.table.setColumnWidth(5, comment_width)
+        self._refresh_visible_row_heights()
+
+    def _calculate_wrapped_row_height(self, operands: str, comment: str) -> int:
+        """根据操作数和注释列当前宽度计算单行应有的高度。"""
+        base_height = self.table.verticalHeader().defaultSectionSize()
+        metrics = self.table.fontMetrics()
+        max_height = base_height
+
+        for column, text in ((4, operands), (5, comment)):
+            if not text:
+                continue
+            available_width = max(40, self.table.columnWidth(column) - 12)
+            rect = metrics.boundingRect(
+                QRect(0, 0, available_width, 10000),
+                Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter,
+                text,
+            )
+            max_height = max(max_height, rect.height() + 10)
+
+        return max_height
+
+    def _refresh_visible_row_heights(self):
+        """列宽变化后，重新计算当前可见缓存行的换行高度。"""
+        default_height = self.table.verticalHeader().defaultSectionSize()
+        for visual_row in range(self.visible_rows):
+            operands_item = self.table.item(visual_row, 4)
+            comment_item = self.table.item(visual_row, 5)
+            operands = operands_item.text() if operands_item else ''
+            comment = comment_item.text() if comment_item else ''
+            target_height = self._calculate_wrapped_row_height(operands, comment)
+            self.table.setRowHeight(visual_row, max(default_height, target_height))
+
+    def refresh_geometry(self):
+        """窗口尺寸变化后，同步刷新表格的行数和列宽。"""
+        self._calculate_visible_rows()
+        self._adjust_column_widths()
+
     def resizeEvent(self, event):
         """resizeEvent function."""
         super().resizeEvent(event)
-        QTimer.singleShot(10, self._calculate_visible_rows)
+        QTimer.singleShot(10, self.refresh_geometry)
     
     def _init_empty_table(self):
         """_init_empty_table function."""
-        self.table.setRowCount(self.visible_rows)
-        for row in range(self.visible_rows):
-            for col in range(6):
-                item = QTableWidgetItem('')
-                self.table.setItem(row, col, item)
+        self._ensure_table_rows(self.visible_rows)
     
     def wheelEvent(self, event: QWheelEvent):
         """wheelEvent function."""
@@ -239,12 +299,12 @@ class VirtualScrollTable(QWidget):
         self.current_top = 0
         self.selected_logical_row = -1
         
-        self._calculate_visible_rows()
+        self.refresh_geometry()
         
-        max_scroll = max(0, total_rows - self.visible_rows)
+        max_scroll = max(0, total_rows - self.page_rows)
         self.scrollbar.setMaximum(max_scroll)
-        self.scrollbar.setPageStep(self.visible_rows)
-        self.scrollbar.setValue(0)
+        self.scrollbar.setPageStep(self.page_rows)
+
 
         self._update_visible_rows()
     
@@ -284,6 +344,8 @@ class VirtualScrollTable(QWidget):
                 item = self.table.item(visual_row, col)
                 if item:
                     item.setText('')
+                    item.setToolTip('')
+            self.table.setRowHeight(visual_row, self.table.verticalHeader().defaultSectionSize())
             return
         
         data = self._get_row_data(logical_row)
@@ -291,14 +353,7 @@ class VirtualScrollTable(QWidget):
         if not data:
             return
         
-        colors = [
-            QColor(128, 128, 128),
-            QColor(86, 156, 214), 
-            QColor(128, 128, 128),
-            QColor(220, 220, 170),
-            QColor(206, 145, 120),
-            QColor(106, 153, 85), 
-        ]
+        colors = self._theme_cell_colors()
         values = [data['num'], data['address'], data['offset'], 
                   data['mnemonic'], data['operands'], data['comment']]
         
@@ -306,16 +361,24 @@ class VirtualScrollTable(QWidget):
             item = self.table.item(visual_row, col)
             if item:
                 item.setText(value)
+                item.setToolTip(value if value else '')
                 item.setForeground(color)
                 if col == 0:
                     item.setTextAlignment(Qt.AlignCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        
+        self.table.setRowHeight(
+            visual_row,
+            self._calculate_wrapped_row_height(data['operands'], data['comment'])
+        )
     
     def _on_scroll_stopped(self):
         """_on_scroll_stopped function."""
         self.is_scrolling = False
         self.allow_heavy_update = True
         
-        middle_row = self.current_top + self.visible_rows // 2
+        middle_row = self.current_top + self.page_rows // 2
         if middle_row >= self.total_rows:
             middle_row = self.total_rows - 1
         
@@ -350,9 +413,9 @@ class VirtualScrollTable(QWidget):
         
         self.selected_logical_row = logical_row
         
-        if logical_row < self.current_top or logical_row >= self.current_top + self.visible_rows:
-            new_top = max(0, logical_row - self.visible_rows // 2)
-            new_top = min(new_top, self.total_rows - self.visible_rows)
+        if logical_row < self.current_top or logical_row >= self.current_top + self.page_rows:
+            new_top = max(0, logical_row - self.page_rows // 2)
+            new_top = min(new_top, max(0, self.total_rows - self.page_rows))
             self.scrollbar.setValue(new_top)
         
         visual_row = logical_row - self.current_top
@@ -362,6 +425,29 @@ class VirtualScrollTable(QWidget):
     def get_selected_logical_row(self) -> int:
         """get_selected_logical_row function."""
         return self.selected_logical_row
+
+    @staticmethod
+    def _theme_cell_colors() -> List[QColor]:
+        """Return semantic colors for the current app theme."""
+        app = QApplication.instance()
+        theme = app.property("taTheme") if app is not None else "amber"
+        if theme == "midnight":
+            return [
+                QColor(123, 156, 176),
+                QColor(116, 216, 255),
+                QColor(123, 156, 176),
+                QColor(214, 242, 255),
+                QColor(163, 225, 255),
+                QColor(129, 214, 163),
+            ]
+        return [
+            QColor(166, 145, 100),
+            QColor(106, 191, 255),
+            QColor(166, 145, 100),
+            QColor(255, 204, 102),
+            QColor(255, 170, 92),
+            QColor(136, 201, 115),
+        ]
 
     def _get_row_data(self, logical_row: int) -> Optional[Dict]:
         """Fetch visible-row data directly from the parser index."""
@@ -437,6 +523,11 @@ class InstructionViewController(QObject):
         self.is_scrolling = False
         self.allow_heavy_update = True
         self.selected_index = -1
+
+    def refresh_geometry(self):
+        """对外暴露的尺寸刷新入口，便于 splitter 拖动时同步适配。"""
+        if self.virtual_table:
+            self.virtual_table.refresh_geometry()
     
     def set_virtual_table(self, virtual_table: VirtualScrollTable):
         """set_virtual_table function."""

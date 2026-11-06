@@ -14,3 +14,9 @@
 /*.traceidx.rgx
 /*.traceidx.mem
 /*.traceidx.mwr
+
+# runtime data & caches (large traces, tool sessions, run logs)
+/dy_trace*.txt
+/.trace_cache/
+/.ida-mcp/
+/trace_run_*.log

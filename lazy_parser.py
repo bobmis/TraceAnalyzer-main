@@ -1,10 +1,12 @@
 """lazy_parser module."""
 
 import bisect
+import hashlib
 import json
 import mmap
 import os
 import re
+import shutil
 import sys
 import threading
 from collections import OrderedDict
@@ -63,6 +65,24 @@ class InstructionIndex:
 class LazyLogParser:
     """LazyLogParser class."""
 
+    CACHE_DIR_NAME = ".trace_cache"
+    CACHE_FILE_PREFIX = "traceidx"
+    UNIDBG_RELATED_DIR_NAME = "unidbg_related"
+    TEMP_ARTIFACT_PATTERNS = (
+        "dy378_*.log",
+        "sweep_*.log",
+        "sweep_*.json",
+        "tmp_*.log",
+        "descB_*.log",
+        "state_*.log",
+        "q0scan.log",
+        "prefix_*observed.hex.txt",
+    )
+    STRING_ANNOTATION_INDEX_VERSION = 1
+    STRING_ANNOTATION_PATTERN = re.compile(
+        r'\b([A-Za-z][\w.]*)\s*=\s*([^\s,]+)\s*\(string:\s*"([^"]*)"\)'
+    )
+
     INDEX_VERSION = 8
     INDEX_RECORD = Struct("<QQQH")
     MNEMONIC_POSTING_ENTRY = Struct("<I")
@@ -92,6 +112,127 @@ class LazyLogParser:
     MEMORY_KIND_WRITE = 1
     MEMORY_KIND_DUMP = 2
     MEMORY_KIND_DUMP_MODIFIED = 3
+
+    @classmethod
+    def get_cache_root(cls) -> Path:
+        """Return the project-local directory used for persistent trace sidecars."""
+        return Path(__file__).resolve().parent / cls.CACHE_DIR_NAME
+
+    @classmethod
+    def get_unidbg_related_root(cls) -> Path:
+        """Return the project-local directory used to group Unidbg-related material."""
+        return Path(__file__).resolve().parent / cls.UNIDBG_RELATED_DIR_NAME
+
+    @classmethod
+    def get_unidbg_logs_root(cls) -> Path:
+        """Return the directory that stores disposable Unidbg debug logs."""
+        return cls.get_unidbg_related_root() / "logs"
+
+    @classmethod
+    def _cache_key_for_file(cls, file_path: str) -> str:
+        """Build a stable cache key from the absolute trace path."""
+        source_path = Path(file_path)
+        try:
+            normalized = str(source_path.resolve())
+        except OSError:
+            normalized = str(source_path.absolute())
+        return hashlib.sha1(
+            normalized.encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
+
+    @classmethod
+    def cache_dir_for_file(cls, file_path: str) -> Path:
+        """Return the dedicated cache directory for a specific trace file."""
+        source_path = Path(file_path)
+        safe_name = re.sub(r"[^0-9A-Za-z._-]+", "_", source_path.name).strip("._")
+        if not safe_name:
+            safe_name = "trace"
+        return cls.get_cache_root() / f"{safe_name}_{cls._cache_key_for_file(file_path)}"
+
+    @classmethod
+    def clear_cache_for_file(cls, file_path: str) -> Tuple[int, Path]:
+        """Delete cached sidecars for one trace from the project cache directory."""
+        removed = 0
+        cache_dir = cls.cache_dir_for_file(file_path)
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            removed += 1
+
+        source_path = Path(file_path)
+        for legacy_path in source_path.parent.glob(f"{source_path.name}.traceidx*"):
+            try:
+                if legacy_path.is_dir():
+                    shutil.rmtree(legacy_path, ignore_errors=True)
+                else:
+                    legacy_path.unlink()
+                removed += 1
+            except OSError:
+                pass
+
+        return removed, cache_dir
+
+    @classmethod
+    def list_temp_artifacts(cls) -> List[Path]:
+        """Return project-root debug/temp artifacts that should be treated as disposable."""
+        project_root = Path(__file__).resolve().parent
+        log_root = cls.get_unidbg_logs_root()
+        seen = set()
+        artifacts: List[Path] = []
+        for base_dir in (project_root, log_root):
+            if not base_dir.exists():
+                continue
+            for pattern in cls.TEMP_ARTIFACT_PATTERNS:
+                for path in base_dir.glob(pattern):
+                    key = str(path.resolve())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    artifacts.append(path)
+        artifacts.sort(key=lambda item: item.name.lower())
+        return artifacts
+
+    @classmethod
+    def clear_temp_artifacts(cls) -> int:
+        """Delete disposable debug/temp artifacts from the project root."""
+        removed = 0
+        for path in cls.list_temp_artifacts():
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+    @classmethod
+    def clear_all_cache(cls) -> Tuple[int, Path]:
+        """Delete the whole project cache directory."""
+        cache_root = cls.get_cache_root()
+        project_root = Path(__file__).resolve().parent
+        removed = 0
+
+        if cache_root.exists():
+            try:
+                removed += sum(1 for _ in cache_root.rglob("*"))
+            except OSError:
+                pass
+            shutil.rmtree(cache_root, ignore_errors=True)
+
+        for legacy_path in project_root.glob("*.traceidx*"):
+            try:
+                if legacy_path.is_dir():
+                    shutil.rmtree(legacy_path, ignore_errors=True)
+                else:
+                    legacy_path.unlink()
+                removed += 1
+            except OSError:
+                pass
+
+        removed += cls.clear_temp_artifacts()
+
+        return removed, cache_root
 
     def __init__(self, file_path: str):
         self.file_path = file_path
@@ -131,6 +272,7 @@ class LazyLogParser:
         self._file_lock = threading.Lock()
         self._thread_files: Dict[int, object] = {}
         self._offset_postings_lock = threading.Lock()
+        self._string_annotations_lock = threading.Lock()
 
         self._index_file = None
         self._index_mmap: Optional[mmap.mmap] = None
@@ -144,12 +286,16 @@ class LazyLogParser:
         self._memory_postings_mmap: Optional[mmap.mmap] = None
         self._memory_write_postings_file = None
         self._memory_write_postings_mmap: Optional[mmap.mmap] = None
+        self._string_annotation_count = 0
+        self._string_annotation_records: Optional[List[Dict[str, object]]] = None
+        self._string_annotation_progress_callback: Optional[Callable[[int, int], None]] = None
 
         self._source_mmap_file = None
         self._source_mmap: Optional[mmap.mmap] = None
         self._source_mmap_lock = threading.Lock()
 
-        self._index_base_path = Path(f"{self.file_path}.traceidx")
+        self._cache_dir = self.cache_dir_for_file(self.file_path)
+        self._index_base_path = self._cache_dir / self.CACHE_FILE_PREFIX
         self._index_data_path = Path(f"{self._index_base_path}.dat")
         self._index_meta_path = Path(f"{self._index_base_path}.json")
         self._checkpoint_data_path = Path(f"{self._index_base_path}.chk")
@@ -159,7 +305,46 @@ class LazyLogParser:
         self._register_postings_path = Path(f"{self._index_base_path}.rgx")
         self._memory_postings_path = Path(f"{self._index_base_path}.mem")
         self._memory_write_postings_path = Path(f"{self._index_base_path}.mwr")
+        self._string_annotations_path = Path(f"{self._index_base_path}.strx")
+        self._string_annotations_meta_path = Path(f"{self._index_base_path}.strm")
         self._legacy_offsets_path = Path(f"{self._index_base_path}.ofs")
+
+    def get_cache_dir(self) -> Path:
+        """Return the current trace cache directory."""
+        return self._cache_dir
+
+    def _ensure_cache_dir(self):
+        """Create the trace cache directory when it is needed."""
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _string_to_hex_bytes(text: str) -> str:
+        """Convert a string payload to a space-separated uppercase HEX preview."""
+        data = (text or "").encode("utf-8", errors="replace")
+        return " ".join(f"{byte:02X}" for byte in data)
+
+    @classmethod
+    def extract_string_annotations_from_line(
+        cls,
+        raw_line: str,
+    ) -> List[Tuple[str, str, str, str]]:
+        """Extract `(string: "...")` annotations from one instruction line."""
+        if not raw_line:
+            return []
+
+        hints: List[Tuple[str, str, str, str]] = []
+        seen = set()
+        for match in cls.STRING_ANNOTATION_PATTERN.finditer(raw_line):
+            reg = match.group(1).upper()
+            value = match.group(2)
+            string_value = match.group(3)
+            hex_bytes = cls._string_to_hex_bytes(string_value)
+            key = (reg, value, string_value, hex_bytes)
+            if key in seen:
+                continue
+            seen.add(key)
+            hints.append(key)
+        return hints
 
     def build_index(
         self,
@@ -194,6 +379,8 @@ class LazyLogParser:
         self._memory_write_bucket_offsets = {}
         self._memory_write_bucket_ids = []
         self._memory_write_record_count = 0
+        self._string_annotation_count = 0
+        self._string_annotation_records = None
 
         with self._cache_lock:
             self._instruction_cache.clear()
@@ -312,6 +499,7 @@ class LazyLogParser:
         progress_callback: Optional[Callable[[int, int], None]],
     ):
         """Scan the trace once and persist compact sidecar indexes."""
+        self._ensure_cache_dir()
         data_tmp = Path(f"{self._index_data_path}.tmp")
         meta_tmp = Path(f"{self._index_meta_path}.tmp")
         mnemonic_tmp = Path(f"{self._mnemonic_postings_path}.tmp")
@@ -320,6 +508,8 @@ class LazyLogParser:
         memory_tmp = Path(f"{self._memory_postings_path}.tmp")
         memory_write_tmp = Path(f"{self._memory_write_postings_path}.tmp")
         memory_raw_tmp = Path(f"{self._memory_postings_path}.raw.tmp")
+        string_annotations_tmp = Path(f"{self._string_annotations_path}.tmp")
+        string_annotations_meta_tmp = Path(f"{self._string_annotations_meta_path}.tmp")
 
         state = RegisterState()
         mnemonic_to_id: Dict[str, int] = {}
@@ -337,12 +527,14 @@ class LazyLogParser:
                 open(data_tmp, "wb") as data_file,
                 open(register_masks_tmp, "wb") as register_mask_file,
                 open(memory_raw_tmp, "wb") as memory_raw_file,
+                open(string_annotations_tmp, "w", encoding="utf-8", newline="\n") as string_annotations_file,
             ):
                 current_fields: Optional[Dict[str, str]] = None
                 current_line = ""
                 current_line_offset = 0
                 current_memory_ops: List[MemoryOperation] = []
                 current_memory_dump: List[MemoryDumpLine] = []
+                string_annotation_count = 0
 
                 def flush_current_instruction():
                     nonlocal current_fields
@@ -350,6 +542,7 @@ class LazyLogParser:
                     nonlocal current_line_offset
                     nonlocal current_memory_ops
                     nonlocal current_memory_dump
+                    nonlocal string_annotation_count
 
                     if not current_fields:
                         return
@@ -459,6 +652,23 @@ class LazyLogParser:
                         memory_bucket_counts[bucket_id] = memory_bucket_counts.get(bucket_id, 0) + 1
                         self._memory_record_count += 1
 
+                    for reg, reg_value, string_value, hex_bytes in self.extract_string_annotations_from_line(current_line):
+                        string_annotations_file.write(
+                            json.dumps(
+                                {
+                                    "index": instruction_index,
+                                    "string_register": reg,
+                                    "register_value": reg_value,
+                                    "string_value": string_value,
+                                    "string_hex": hex_bytes,
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        )
+                        string_annotations_file.write("\n")
+                        string_annotation_count += 1
+
                     if instruction_index % self.checkpoint_interval == 0:
                         self.prebuilt_checkpoints[instruction_index] = state.copy()
 
@@ -563,9 +773,21 @@ class LazyLogParser:
                     [bucket_id, memory_write_bucket_offsets[bucket_id], bucket_count]
                     for bucket_id, bucket_count in sorted(memory_write_bucket_counts.items())
                 ],
+                "string_annotation_count": string_annotation_count,
             }
             with open(meta_tmp, "w", encoding="utf-8") as meta_file:
                 json.dump(meta, meta_file)
+            with open(string_annotations_meta_tmp, "w", encoding="utf-8") as string_meta_file:
+                json.dump(
+                    {
+                        "version": self.STRING_ANNOTATION_INDEX_VERSION,
+                        "instruction_count": self._instruction_count,
+                        "string_annotation_count": string_annotation_count,
+                        "source_size": self.file_size,
+                        "source_mtime_ns": source_stat.st_mtime_ns,
+                    },
+                    string_meta_file,
+                )
 
             os.replace(data_tmp, self._index_data_path)
             os.replace(meta_tmp, self._index_meta_path)
@@ -573,6 +795,8 @@ class LazyLogParser:
             os.replace(register_tmp, self._register_postings_path)
             os.replace(memory_tmp, self._memory_postings_path)
             os.replace(memory_write_tmp, self._memory_write_postings_path)
+            os.replace(string_annotations_tmp, self._string_annotations_path)
+            os.replace(string_annotations_meta_tmp, self._string_annotations_meta_path)
 
             self._mnemonic_table = mnemonic_table
             self._mnemonic_counts = mnemonic_counts
@@ -586,6 +810,7 @@ class LazyLogParser:
             self._memory_write_bucket_counts = dict(memory_write_bucket_counts)
             self._memory_write_bucket_offsets = memory_write_bucket_offsets
             self._memory_write_bucket_ids = sorted(memory_write_bucket_counts.keys())
+            self._string_annotation_count = string_annotation_count
             self.save_checkpoint_sidecar(self.prebuilt_checkpoints, self.checkpoint_interval)
 
             if self._legacy_offsets_path.exists():
@@ -603,6 +828,8 @@ class LazyLogParser:
                 memory_tmp,
                 memory_write_tmp,
                 memory_raw_tmp,
+                string_annotations_tmp,
+                string_annotations_meta_tmp,
             ):
                 if temp_path.exists():
                     try:
@@ -881,6 +1108,7 @@ class LazyLogParser:
             self._memory_write_bucket_offsets[bucket_id] = int(bucket_offset)
             self._memory_write_bucket_counts[bucket_id] = int(bucket_count)
         self._memory_write_bucket_ids = sorted(self._memory_write_bucket_counts.keys())
+        self._string_annotation_count = int(meta.get("string_annotation_count", 0))
         self.prebuilt_checkpoints = self._load_checkpoint_sidecar(self.checkpoint_interval)
 
         if len(self._mnemonic_table) != len(self._mnemonic_counts):
@@ -943,6 +1171,221 @@ class LazyLogParser:
         """Return whether exact-offset posting sidecars are already present."""
         return self._offset_postings_meta_path.exists() and self._offset_postings_path.exists()
 
+    def _load_string_annotations_sidecar_metadata(
+        self,
+        source_stat: Optional[os.stat_result] = None,
+    ) -> bool:
+        """Load sidecar metadata for cached string annotations when available."""
+        if not (self._string_annotations_meta_path.exists() and self._string_annotations_path.exists()):
+            return False
+
+        try:
+            with open(self._string_annotations_meta_path, "r", encoding="utf-8") as meta_file:
+                meta = json.load(meta_file)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+
+        if int(meta.get("version", -1)) != self.STRING_ANNOTATION_INDEX_VERSION:
+            return False
+        if int(meta.get("instruction_count", -1)) != self._instruction_count:
+            return False
+        if source_stat is not None and int(meta.get("source_size", -1)) != int(source_stat.st_size):
+            return False
+        if source_stat is not None and int(meta.get("source_mtime_ns", -1)) != int(source_stat.st_mtime_ns):
+            return False
+
+        self._string_annotation_count = int(meta.get("string_annotation_count", 0))
+        return True
+
+    def has_string_annotations_sidecar(self) -> bool:
+        """Return whether the cached string-annotation sidecar is already present."""
+        try:
+            source_stat = os.stat(self.file_path)
+        except OSError:
+            return False
+        return self._load_string_annotations_sidecar_metadata(source_stat)
+
+    def _build_string_annotations_sidecar(self, source_stat: os.stat_result) -> int:
+        """Build a compact cache of `(string: \"...\")` annotations from instruction lines."""
+        self._ensure_cache_dir()
+        tmp_path = Path(f"{self._string_annotations_path}.tmp")
+        meta_tmp_path = Path(f"{self._string_annotations_meta_path}.tmp")
+        count = 0
+        instruction_index = 0
+        progress_step = max(8 * 1024 * 1024, min(self.file_size, 64 * 1024 * 1024))
+        next_progress = progress_step
+
+        try:
+            with (
+                open(self.file_path, "rb") as source_file,
+                open(tmp_path, "w", encoding="utf-8", newline="\n") as sidecar_file,
+            ):
+                while True:
+                    raw_line = source_file.readline()
+                    if not raw_line:
+                        break
+
+                    line = raw_line.decode("utf-8", errors="ignore")
+                    trimmed = line.strip()
+                    if not parse_instruction_fields(trimmed):
+                        current_offset = source_file.tell()
+                        if (
+                            hasattr(self, "_string_annotation_progress_callback")
+                            and self._string_annotation_progress_callback
+                            and current_offset >= next_progress
+                        ):
+                            self._string_annotation_progress_callback(current_offset, self.file_size)
+                            next_progress = current_offset + progress_step
+                        continue
+
+                    for reg, reg_value, string_value, hex_bytes in self.extract_string_annotations_from_line(line):
+                        sidecar_file.write(
+                            json.dumps(
+                                {
+                                    "index": instruction_index,
+                                    "string_register": reg,
+                                    "register_value": reg_value,
+                                    "string_value": string_value,
+                                    "string_hex": hex_bytes,
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        )
+                        sidecar_file.write("\n")
+                        count += 1
+
+                    instruction_index += 1
+                    current_offset = source_file.tell()
+                    if (
+                        hasattr(self, "_string_annotation_progress_callback")
+                        and self._string_annotation_progress_callback
+                        and current_offset >= next_progress
+                    ):
+                        self._string_annotation_progress_callback(current_offset, self.file_size)
+                        next_progress = current_offset + progress_step
+
+            with open(meta_tmp_path, "w", encoding="utf-8") as meta_file:
+                json.dump(
+                    {
+                        "version": self.STRING_ANNOTATION_INDEX_VERSION,
+                        "instruction_count": self._instruction_count,
+                        "string_annotation_count": count,
+                        "source_size": int(source_stat.st_size),
+                        "source_mtime_ns": int(source_stat.st_mtime_ns),
+                    },
+                    meta_file,
+                )
+
+            os.replace(tmp_path, self._string_annotations_path)
+            os.replace(meta_tmp_path, self._string_annotations_meta_path)
+            self._string_annotation_count = count
+            self._string_annotation_records = None
+            if hasattr(self, "_string_annotation_progress_callback") and self._string_annotation_progress_callback:
+                self._string_annotation_progress_callback(self.file_size, self.file_size)
+            return count
+        finally:
+            for temp_path in (tmp_path, meta_tmp_path):
+                if temp_path.exists():
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
+
+    def _ensure_string_annotations_sidecar(
+        self,
+        force_build: bool = True,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
+        """Open or build the string-annotation sidecar on demand."""
+        acquired = self._string_annotations_lock.acquire(blocking=force_build)
+        if not acquired:
+            return False
+        try:
+            source_stat = os.stat(self.file_path)
+            if self._load_string_annotations_sidecar_metadata(source_stat):
+                return True
+            if not force_build:
+                return False
+            self._string_annotation_progress_callback = progress_callback
+            self._build_string_annotations_sidecar(source_stat)
+            return self._load_string_annotations_sidecar_metadata(source_stat)
+        finally:
+            self._string_annotation_progress_callback = None
+            self._string_annotations_lock.release()
+
+    def rebuild_string_annotations_sidecar(
+        self,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> int:
+        """Force a rebuild of the string-annotation sidecar for the current trace."""
+        with self._string_annotations_lock:
+            source_stat = os.stat(self.file_path)
+            self._string_annotation_progress_callback = progress_callback
+            try:
+                count = self._build_string_annotations_sidecar(source_stat)
+                self._load_string_annotations_sidecar_metadata(source_stat)
+                self._string_annotation_records = None
+                return int(count)
+            finally:
+                self._string_annotation_progress_callback = None
+
+    def _load_string_annotation_records(self, force_build: bool = True) -> List[Dict[str, object]]:
+        """Load cached string-annotation records into memory for repeated searches."""
+        cached = self._string_annotation_records
+        if cached is not None:
+            return cached
+        if not self._ensure_string_annotations_sidecar(force_build=force_build):
+            return []
+
+        records: List[Dict[str, object]] = []
+        try:
+            with open(self._string_annotations_path, "r", encoding="utf-8") as sidecar_file:
+                for raw_line in sidecar_file:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        record = json.loads(raw_line)
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+                    try:
+                        record["index"] = int(record.get("index", -1))
+                    except (TypeError, ValueError):
+                        record["index"] = -1
+                    records.append(record)
+        except OSError:
+            return []
+
+        self._string_annotation_records = records
+        self._string_annotation_count = len(records)
+        return records
+
+    def iter_string_annotation_matches(
+        self,
+        query: str,
+        limit: Optional[int] = None,
+    ) -> Iterator[Dict[str, object]]:
+        """Yield cached string-annotation matches for a case-insensitive substring query."""
+        query_text = (query or "").strip()
+        if not query_text:
+            return
+
+        query_lower = query_text.lower()
+        yielded = 0
+        for record in self._load_string_annotation_records(force_build=True):
+            string_value = str(record.get("string_value", ""))
+            if query_lower not in string_value.lower():
+                continue
+            yield record
+            yielded += 1
+            if limit is not None and yielded >= limit:
+                return
+
+    def get_string_annotation_count(self) -> int:
+        """Return how many cached string-annotation records are currently known."""
+        return int(self._string_annotation_count)
+
     def _ensure_offset_postings(self, force_build: bool = True) -> bool:
         """Open or build the lazy exact-offset posting sidecar on demand."""
         acquired = self._offset_postings_lock.acquire(blocking=force_build)
@@ -956,6 +1399,7 @@ class LazyLogParser:
             if not self._load_offset_postings_metadata(source_stat):
                 if not force_build:
                     return False
+                self._ensure_cache_dir()
                 postings_tmp = Path(f"{self._offset_postings_path}.tmp")
                 meta_tmp = Path(f"{self._offset_postings_meta_path}.tmp")
                 try:
@@ -1038,6 +1482,7 @@ class LazyLogParser:
         if not checkpoints:
             return False
 
+        self._ensure_cache_dir()
         target_interval = max(1, int(checkpoint_interval or self.checkpoint_interval))
         temp_path = Path(f"{self._checkpoint_data_path}.tmp")
 
@@ -2133,6 +2578,8 @@ class LazyLogParser:
         self,
         tokens: List[str],
         limit: Optional[int] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        yield_callback: Optional[Callable[..., None]] = None,
     ) -> Iterator[int]:
         """Yield instruction indices whose raw source lines contain any requested token."""
         if self._instruction_count <= 0:
@@ -2156,11 +2603,19 @@ class LazyLogParser:
         source_map = self._ensure_source_mmap()
         yielded = 0
         seen_indices = set()
+        token_count = len(normalized_tokens)
+        total_work = max(1, self.file_size * max(1, token_count))
+        progress_step = max(8 * 1024 * 1024, min(self.file_size, 64 * 1024 * 1024))
 
-        for normalized, token_bytes in normalized_tokens:
+        for token_index, (normalized, token_bytes) in enumerate(normalized_tokens):
             pos = 0
             last_line_start = -1
             step = max(1, len(token_bytes))
+            base_progress = token_index * self.file_size
+            next_progress = progress_step
+            next_yield = progress_step
+            if progress_callback:
+                progress_callback(base_progress, total_work)
             while pos < self.file_size:
                 found = source_map.find(token_bytes, pos, self.file_size)
                 if found < 0:
@@ -2185,9 +2640,23 @@ class LazyLogParser:
                         yield index
                         yielded += 1
                         if limit is not None and yielded >= limit:
+                            if progress_callback:
+                                progress_callback(total_work, total_work)
                             return
 
                 pos = found + step
+                if yield_callback and pos >= next_yield:
+                    try:
+                        yield_callback()
+                    except TypeError:
+                        yield_callback(pos)
+                    next_yield = pos + progress_step
+                if progress_callback and pos >= next_progress:
+                    progress_callback(min(base_progress + pos, total_work), total_work)
+                    next_progress = pos + progress_step
+
+        if progress_callback:
+            progress_callback(total_work, total_work)
 
     def parse_batch(self, start_index: int, count: int) -> List[Instruction]:
         """parse_batch function."""
